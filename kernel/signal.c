@@ -411,6 +411,15 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
             if (sig == SIGTRAP_) {
                 struct cpu_state *cpu = &current->cpu;
                 static __thread int trap_skips = 0;
+                static __thread uint64_t last_trap_pc = 0;
+                // Reset the per-thread skip counter when we move to a
+                // brand new PC; assertions cluster, but if we successfully
+                // resume past one we shouldn't count the next as part of
+                // a fork-bomb.
+                if (cpu->pc != last_trap_pc) {
+                    trap_skips = 0;
+                    last_trap_pc = cpu->pc;
+                }
                 fprintf(stderr,
                         "V8_SIGTRAP: pc=0x%llx x0=0x%llx sp=%llx fp=%llx lr=%llx skip=%d\n",
                         (unsigned long long)cpu->pc,
@@ -419,16 +428,33 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
                         (unsigned long long)cpu->regs[29],
                         (unsigned long long)cpu->regs[30],
                         trap_skips);
-                if (trap_skips < 64 && cpu->regs[30] != 0) {
+                if (trap_skips < 8) {
                     trap_skips++;
-                    cpu->regs[0] = 0;     // return value: 0 / false / NULL
-                    cpu->pc = cpu->regs[30]; // jump to lr (emulate ret)
+                    // Recovery strategy depends on whether lr looks like
+                    // an actual return address or whether it's the same
+                    // as pc (Bun's panic_handler self-loop, where lr was
+                    // never set up because the trap is at the very top
+                    // of a noreturn function).
+                    if (cpu->regs[30] != 0 && cpu->regs[30] != cpu->pc) {
+                        // BRK inside a normal function: emulate `ret`.
+                        cpu->regs[0] = 0;          // return 0 / false / NULL
+                        cpu->pc = cpu->regs[30];
+                    } else {
+                        // BRK in a noreturn / panic handler: just step
+                        // past the brk instruction (4 bytes on arm64)
+                        // and hope the next instruction is recoverable.
+                        // If it isn't we'll trap again and the per-pc
+                        // skip cap will fire.
+                        cpu->pc += 4;
+                    }
                     unlock(&sighand->lock);
                     return;
                 }
                 trap_skips = 0;
+                last_trap_pc = 0;
                 fprintf(stderr,
-                        "V8_SIGTRAP: too many skips or no lr, terminating\n");
+                        "V8_SIGTRAP: too many skips at pc=0x%llx, terminating\n",
+                        (unsigned long long)cpu->pc);
                 do_exit_group(1 << 8);
                 return;
             }
