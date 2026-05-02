@@ -454,11 +454,80 @@ int realfs_rmdir(struct mount *mount, const char *path) {
     return 0;
 }
 
+// Recursive rmdir helper used only when emulating Linux's
+// rename-atop-non-empty-dir semantics. We are extremely defensive:
+// only walk the immediate dst we already know exists, avoid following
+// symlinks, and stop on any error so we can't accidentally trash a
+// hard-linked subtree.
+static int unlinkat_recursive(int parent_fd, const char *name) {
+    int fd = openat(parent_fd, name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        // Not a directory or unreachable — try plain unlink.
+        if (unlinkat(parent_fd, name, 0) == 0)
+            return 0;
+        return -errno;
+    }
+    DIR *d = fdopendir(fd);
+    if (d == NULL) { close(fd); return -errno; }
+    struct dirent *de;
+    int err = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        int sub_err = unlinkat_recursive(fd, de->d_name);
+        if (sub_err < 0) { err = sub_err; break; }
+    }
+    closedir(d); // closes fd too
+    if (err < 0) return err;
+    if (unlinkat(parent_fd, name, AT_REMOVEDIR) < 0)
+        return -errno;
+    return 0;
+}
+
 int realfs_rename(struct mount *mount, const char *src, const char *dst) {
-    int err = renameat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst));
-    if (err < 0)
-        return errno_map();
-    return err;
+    const char *src_fixed = fix_path(src);
+    int err = renameat(mount->root_fd,
+                       src_fixed,
+                       mount->root_fd, fix_path(dst));
+    if (err == 0)
+        return 0;
+    int saved = errno;
+
+    // Linux's renameat() atomically replaces dst if both src and dst are
+    // directories — even when dst is non-empty. macOS / BSD's renameat
+    // returns ENOTEMPTY in that case, which breaks every Linux-targeting
+    // tool that does atomic-replace installs (npm, dpkg-style staging,
+    // etc.). Emulate the Linux semantic here when we can do so safely:
+    //
+    //   - The host-side rename failed with ENOTEMPTY or EEXIST.
+    //   - Both src and dst exist and both are directories on the host.
+    //
+    // We then recursively remove dst and retry the renameat.
+    //
+    // The path manipulation always goes through fix_path() (which
+    // dereferences relative paths against the mount root); racey writers
+    // can't trick this into removing something outside the mount.
+    if (saved == ENOTEMPTY || saved == EEXIST) {
+        const char *dst_fixed = fix_path(dst);
+        struct stat src_st, dst_st;
+        if (fstatat(mount->root_fd, src_fixed, &src_st,
+                    AT_SYMLINK_NOFOLLOW) == 0
+            && fstatat(mount->root_fd, dst_fixed, &dst_st,
+                       AT_SYMLINK_NOFOLLOW) == 0
+            && S_ISDIR(src_st.st_mode)
+            && S_ISDIR(dst_st.st_mode)) {
+            int rm_err = unlinkat_recursive(mount->root_fd, dst_fixed);
+            if (rm_err == 0) {
+                if (renameat(mount->root_fd, src_fixed,
+                             mount->root_fd, dst_fixed) == 0)
+                    return 0;
+                saved = errno;
+            }
+        }
+    }
+    errno = saved;
+    return errno_map();
 }
 
 int realfs_symlink(struct mount *mount, const char *target, const char *link) {
