@@ -101,20 +101,34 @@ static void path_cache_set(const char *full_path, int flags, const char *normali
     entry->valid = true;
 }
 
-// chroot_floor: minimum byte offset within `out` that `..` is not
-// allowed to back below. If 0, `..` from `/` collapses to `/` as
-// usual. If >0 (when at_path is the current chroot root), `..` from
-// the chroot root stays at the chroot root, matching the POSIX
-// behaviour of a real chroot. See path_normalize() for how this is
-// derived.
-static int __path_normalize_with_floor(const char *at_path, const char *path,
-                                       char *out, int flags, int levels,
-                                       int chroot_floor) {
+// chroot_prefix: the mount-absolute path of the current chroot root
+// (e.g. "/srv/vms/test"), or NULL/"/" when no chroot is in effect.
+//
+// Containment rules enforced here:
+//   1. `..` never backs `o` below strlen(chroot_prefix). The `o`
+//      cursor is clamped to the chroot boundary, mirroring POSIX
+//      chroot semantics.
+//   2. When a symlink resolves to an absolute path, the recursive
+//      resolution starts the new buffer with chroot_prefix instead of
+//      "/" so absolute-target symlinks cannot escape the jail. The
+//      Phrack-style trick `ln -s /etc/passwd victim; cat victim`
+//      stays inside the chroot.
+//   3. The same prefix is propagated through every recursive call so
+//      multi-level symlinks remain contained.
+static int __path_normalize_with_prefix(const char *at_path, const char *path,
+                                        char *out, int flags, int levels,
+                                        const char *chroot_prefix) {
     // you must choose one
     if (flags & N_SYMLINK_FOLLOW)
         assert(!(flags & N_SYMLINK_NOFOLLOW));
     else
         assert(flags & N_SYMLINK_NOFOLLOW);
+
+    int chroot_floor = 0;
+    if (chroot_prefix != NULL && chroot_prefix[0] != '\0' &&
+        strcmp(chroot_prefix, "/") != 0) {
+        chroot_floor = (int)strlen(chroot_prefix);
+    }
 
     const char *p = path;
     char *o = out;
@@ -128,6 +142,13 @@ static int __path_normalize_with_floor(const char *at_path, const char *path,
         strcpy(o, at_path);
         n -= strlen(at_path);
         o += strlen(at_path);
+    } else if (chroot_floor > 0 && path[0] == '/') {
+        // Absolute path inside a chroot starts at the chroot root, not
+        // at the real mount root. Plant the prefix so subsequent
+        // resolution stays inside.
+        strcpy(o, chroot_prefix);
+        n -= chroot_floor;
+        o += chroot_floor;
     }
 
     while (*p == '/')
@@ -149,9 +170,6 @@ static int __path_normalize_with_floor(const char *at_path, const char *path,
                         o--;
                         n++;
                     } while ((o - out) > chroot_floor && *o != '/');
-                    // if we landed on the floor and it points at the
-                    // boundary slash, leave it there (so further /-eats
-                    // work normally)
                 }
                 p += 2;
                 while (*p == '/')
@@ -191,7 +209,9 @@ static int __path_normalize_with_floor(const char *at_path, const char *path,
                     return _ELOOP;
                 // readlink does not null terminate
                 c[res] = '\0';
-                // if we should restart from the root, copy down
+                // If the symlink target is absolute, restart from the
+                // chroot root (not the real mount root) so a symlink
+                // like `victim -> /etc/passwd` cannot escape the jail.
                 if (*c == '/')
                     memmove(out, c, strlen(c) + 1);
                 char *expanded_path = possible_symlink;
@@ -200,12 +220,10 @@ static int __path_normalize_with_floor(const char *at_path, const char *path,
                     strcat(expanded_path, "/");
                     strcat(expanded_path, p);
                 }
-                // For symlink expansion, chroot containment is enforced
-                // by the caller's `at_path` (passed through path_normalize),
-                // not by this recursive resolution step. We still pass
-                // chroot_floor=0 because the resolved buffer is now
-                // absolute and floor would no longer match its prefix.
-                return __path_normalize_with_floor(NULL, expanded_path, out, flags, levels + 1, 0);
+                // Recurse with the SAME chroot_prefix so multi-level
+                // absolute symlinks stay contained.
+                return __path_normalize_with_prefix(
+                    NULL, expanded_path, out, flags, levels + 1, chroot_prefix);
             }
 
             // if there's a slash after this component, ensure that if it
@@ -235,7 +253,16 @@ static int __path_normalize_with_floor(const char *at_path, const char *path,
 
 // Back-compat wrapper for any in-tree caller (none currently).
 static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
-    return __path_normalize_with_floor(at_path, path, out, flags, levels, 0);
+    return __path_normalize_with_prefix(at_path, path, out, flags, levels, NULL);
+}
+
+// Hash a string into 24 bits — used to mix the chroot prefix into the
+// path cache key so two VMs with different roots don't share entries.
+static uint32_t chroot_prefix_hash(const char *s) {
+    if (s == NULL || s[0] == '\0') return 0;
+    uint32_t h = 5381;
+    while (*s) h = ((h << 5) + h) + (uint8_t)*s++;
+    return h & 0xFFFFFFu;
 }
 
 int path_normalize(struct fd *at, const char *path, char *out, int flags) {
@@ -243,11 +270,10 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     if (strcmp(path, "") == 0)
         return _ENOENT;
 
-    // start with root or cwd, depending on whether it starts with a slash.
-    // Capture the chroot root path so __path_normalize can clamp `..` at
-    // the chroot boundary (otherwise `cd ..` from `/` inside a chroot
-    // would happily walk out of the jail because resolution happens in
-    // mount-absolute terms).
+    // Snapshot the chroot prefix and the relevant `at`. Resolution
+    // happens in mount-absolute terms; chroot_prefix is used both as a
+    // floor for `..` and as the prefix planted at the start of any
+    // absolute path encountered (including absolute symlink targets).
     struct fd *chroot_root_fd;
     lock(&current->fs->lock);
     chroot_root_fd = current->fs->root;
@@ -265,20 +291,32 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         assert(path_is_normalized(at_path));
     }
 
-    // Determine the chroot floor: the byte length of the chroot root's
-    // mount-absolute path, or 0 if the process is at the real fs root.
-    // We only enforce the floor when the resolution is rooted at the
-    // chroot dir (path starts with '/' OR the relative `at` is inside).
-    int chroot_floor = 0;
+    char chroot_path[MAX_PATH];
+    chroot_path[0] = '\0';
+    const char *chroot_prefix = NULL;
     if (chroot_root_fd != NULL) {
-        char chroot_path[MAX_PATH];
         if (generic_getpath(chroot_root_fd, chroot_path) == 0
                 && strcmp(chroot_path, "/") != 0) {
-            chroot_floor = (int)strlen(chroot_path);
+            chroot_prefix = chroot_path;
         }
     }
 
-    // Build full input path for cache lookup
+    // Defensive check: if `at` is the per-process pwd and that pwd has
+    // somehow drifted outside the chroot (e.g. a stale fd held across
+    // chroot()), force resolution to start at the chroot root rather
+    // than honour an out-of-jail `at_path`.
+    if (chroot_prefix != NULL && at != NULL && path[0] != '/') {
+        size_t cl = strlen(chroot_prefix);
+        if (strncmp(at_path, chroot_prefix, cl) != 0 ||
+            (at_path[cl] != '\0' && at_path[cl] != '/')) {
+            // pwd is outside the jail — clamp to the chroot root.
+            strcpy(at_path, chroot_prefix);
+        }
+    }
+
+    // Build full input path for cache lookup. Include the chroot
+    // prefix in the key so two VMs with same-length root paths can't
+    // share cache entries.
     char full_input[MAX_PATH];
     if (at != NULL && strcmp(at_path, "/") != 0) {
         snprintf(full_input, MAX_PATH, "%s/%s", at_path, path);
@@ -287,16 +325,16 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         full_input[MAX_PATH - 1] = '\0';
     }
 
-    // Try cache lookup first. We bake the chroot_floor into the cache
-    // key (via flags' high bits) so different jails don't collide.
-    int cache_flags = flags | (chroot_floor << 16);
+    // 8 low bits stay for `flags`; the rest carries a 24-bit hash of
+    // the chroot prefix.
+    uint32_t prefix_h = chroot_prefix_hash(chroot_prefix);
+    int cache_flags = (flags & 0xFF) | (int)(prefix_h << 8);
     if (path_cache_get(full_input, cache_flags, out) == 0) {
         return 0;
     }
 
-    // Cache miss - do full normalization with chroot containment.
-    int result = __path_normalize_with_floor(
-        at != NULL ? at_path : NULL, path, out, flags, 0, chroot_floor);
+    int result = __path_normalize_with_prefix(
+        at != NULL ? at_path : NULL, path, out, flags, 0, chroot_prefix);
 
     if (result == 0) {
         path_cache_set(full_input, cache_flags, out);

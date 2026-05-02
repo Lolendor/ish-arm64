@@ -296,6 +296,28 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
     return err;
 }
 
+// Strip the calling task's chroot prefix (if any) from a mount-absolute
+// path so the guest never sees paths above its jail root via /proc.
+// `buf` is rewritten in place.
+static void strip_caller_chroot_prefix(char *buf) {
+    if (buf == NULL || buf[0] == '\0') return;
+    char chroot_path[MAX_PATH];
+    lock(&current->fs->lock);
+    int err = current->fs->root != NULL
+        ? generic_getpath(current->fs->root, chroot_path) : -1;
+    unlock(&current->fs->lock);
+    if (err < 0 || strcmp(chroot_path, "/") == 0) return;
+    size_t cl = strlen(chroot_path);
+    if (strncmp(buf, chroot_path, cl) == 0 &&
+        (buf[cl] == '\0' || buf[cl] == '/')) {
+        memmove(buf, buf + cl, strlen(buf) - cl + 1);
+        if (buf[0] == '\0') strcpy(buf, "/");
+    } else {
+        // The path is outside the caller's jail. Don't leak it.
+        strcpy(buf, "/");
+    }
+}
+
 static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
     if (task == NULL)
@@ -308,6 +330,8 @@ static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
         err = generic_getpath(task->mm->exefile, buf);
     unlock(&task->general_lock);
     proc_put_task(task);
+    if (err == 0)
+        strip_caller_chroot_prefix(buf);
     return err;
 }
 
@@ -336,6 +360,8 @@ static int proc_pid_cwd_readlink(struct proc_entry *entry, char *buf) {
     int err = generic_getpath(task->fs->pwd, buf);
     unlock(&task->fs->lock);
     proc_put_task(task);
+    if (err == 0)
+        strip_caller_chroot_prefix(buf);
     return err;
 }
 

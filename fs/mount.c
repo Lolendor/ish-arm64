@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <string.h>
 #include <sys/stat.h>
 #include "kernel/calls.h"
@@ -175,7 +176,22 @@ bool mount_param_flag(const char *info, const char *flag) {
 #define MS_SUPPORTED (MS_READONLY_|MS_NOSUID_|MS_NODEV_|MS_NOEXEC_|MS_SILENT_)
 #define MS_FLAGS (MS_READONLY_|MS_NOSUID_|MS_NODEV_|MS_NOEXEC_)
 
+// Returns true if the calling task is currently confined by chroot
+// (i.e. fs->root resolves to anything other than "/"). Used to refuse
+// state-changing operations whose effect is mount-table-global and
+// therefore breaks the per-VM isolation invariant.
+static bool is_chrooted(void) {
+    char rp[MAX_PATH];
+    lock(&current->fs->lock);
+    struct fd *root = current->fs->root;
+    int err = root != NULL ? generic_getpath(root, rp) : -1;
+    unlock(&current->fs->lock);
+    return err == 0 && strcmp(rp, "/") != 0;
+}
+
 dword_t sys_mount(addr_t source_addr, addr_t point_addr, addr_t type_addr, dword_t flags, addr_t data_addr) {
+    if (is_chrooted())
+        return _EPERM;
     char source[MAX_PATH];
     if (user_read_string(source_addr, source, sizeof(source)))
         return _EFAULT;
@@ -228,6 +244,8 @@ dword_t sys_mount(addr_t source_addr, addr_t point_addr, addr_t type_addr, dword
 #define UMOUNT_NOFOLLOW_ 8
 
 dword_t sys_umount2(addr_t target_addr, dword_t flags) {
+    if (is_chrooted())
+        return _EPERM;
     char target_raw[MAX_PATH];
     if (user_read_string(target_addr, target_raw, sizeof(target_raw)))
         return _EFAULT;

@@ -679,9 +679,34 @@ dword_t sys_chroot(addr_t path_addr) {
     struct fd *dir = open_dir(path);
     if (IS_ERR(dir))
         return PTR_ERR(dir);
+
+    // Clamp pwd to the new root so a stale pwd held from before the
+    // chroot can't be used as an escape hatch by subsequent relative
+    // paths. Real Linux keeps pwd as-is, but iSH's path resolution
+    // happens in mount-absolute terms; if pwd remains above the new
+    // root, `..` from it walks out. We re-anchor pwd at the new root.
+    struct fd *new_pwd_dir = NULL;
+    {
+        char new_root_path[MAX_PATH];
+        if (generic_getpath(dir, new_root_path) == 0) {
+            // Re-open the new root through the FS layer so we have a
+            // distinct fd whose lifetime is independent of `dir`.
+            // We do this BEFORE swapping fs->root so generic_open
+            // resolves against the OLD root (the new root's path is
+            // mount-absolute, not relative to anything).
+            new_pwd_dir = open_dir(path);
+        }
+    }
+
     lock(&current->fs->lock);
     fd_close(current->fs->root);
     current->fs->root = dir;
+    if (new_pwd_dir != NULL && !IS_ERR(new_pwd_dir)) {
+        // Always re-anchor pwd at the new root: simpler and strictly
+        // safer than only doing it when the old pwd is provably outside.
+        fd_close(current->fs->pwd);
+        current->fs->pwd = new_pwd_dir;
+    }
     unlock(&current->fs->lock);
     return 0;
 }
