@@ -103,21 +103,27 @@ static void path_cache_set(const char *full_path, int flags, const char *normali
 
 // chroot_prefix: the mount-absolute path of the current chroot root
 // (e.g. "/srv/vms/test"), or NULL/"/" when no chroot is in effect.
+// path_is_mount_absolute: caller guarantees `path` is already in
+// mount-absolute terms (i.e. starts with `/` from the real fs root).
+// This is the case during recursive symlink expansion when we already
+// built the absolute path in `out` on the previous level. Top-level
+// callers from path_normalize() pass false: their `path` is given in
+// chroot-relative terms (the user typed `/etc/passwd`, meaning
+// "/etc/passwd inside the jail").
 //
-// Containment rules enforced here:
-//   1. `..` never backs `o` below strlen(chroot_prefix). The `o`
-//      cursor is clamped to the chroot boundary, mirroring POSIX
+// Containment rules:
+//   1. `..` never backs `o` below strlen(chroot_prefix); mirrors POSIX
 //      chroot semantics.
-//   2. When a symlink resolves to an absolute path, the recursive
-//      resolution starts the new buffer with chroot_prefix instead of
-//      "/" so absolute-target symlinks cannot escape the jail. The
-//      Phrack-style trick `ln -s /etc/passwd victim; cat victim`
-//      stays inside the chroot.
-//   3. The same prefix is propagated through every recursive call so
-//      multi-level symlinks remain contained.
+//   2. A user-supplied absolute path (or an absolute symlink target,
+//      which is *also* user-namespace) starts with chroot_prefix
+//      planted, so it cannot reach above the jail.
+//   3. A mount-absolute recursive call (relative symlink that we
+//      already resolved) is treated verbatim — its output already
+//      contains the prefix.
 static int __path_normalize_with_prefix(const char *at_path, const char *path,
                                         char *out, int flags, int levels,
-                                        const char *chroot_prefix) {
+                                        const char *chroot_prefix,
+                                        bool path_is_mount_absolute) {
     // you must choose one
     if (flags & N_SYMLINK_FOLLOW)
         assert(!(flags & N_SYMLINK_NOFOLLOW));
@@ -142,10 +148,12 @@ static int __path_normalize_with_prefix(const char *at_path, const char *path,
         strcpy(o, at_path);
         n -= strlen(at_path);
         o += strlen(at_path);
-    } else if (chroot_floor > 0 && path[0] == '/') {
-        // Absolute path inside a chroot starts at the chroot root, not
-        // at the real mount root. Plant the prefix so subsequent
-        // resolution stays inside.
+    } else if (chroot_floor > 0 && path[0] == '/' && !path_is_mount_absolute) {
+        // Caller-supplied absolute path inside a chroot starts at the
+        // chroot root. Plant the prefix so subsequent resolution stays
+        // inside the jail. (Skipped when path is already a mount-
+        // absolute string carried over from a previous resolution
+        // step; that string already includes the prefix.)
         strcpy(o, chroot_prefix);
         n -= chroot_floor;
         o += chroot_floor;
@@ -209,21 +217,45 @@ static int __path_normalize_with_prefix(const char *at_path, const char *path,
                     return _ELOOP;
                 // readlink does not null terminate
                 c[res] = '\0';
-                // If the symlink target is absolute, restart from the
-                // chroot root (not the real mount root) so a symlink
-                // like `victim -> /etc/passwd` cannot escape the jail.
-                if (*c == '/')
-                    memmove(out, c, strlen(c) + 1);
+
+                // Two cases for the symlink's text payload:
+                //   abs ("/foo")  — user-namespace absolute: must be
+                //       re-prefixed with chroot_prefix so it stays
+                //       inside the jail. We feed it to the recursive
+                //       call as a non-mount-absolute path.
+                //   rel ("foo")   — relative to the symlink's parent
+                //       directory; the in-progress `out` buffer
+                //       already names that parent in mount-absolute
+                //       terms. Concatenate and recurse with
+                //       path_is_mount_absolute=true so we don't
+                //       double-plant the prefix.
+                bool target_is_user_absolute = (*c == '/');
                 char *expanded_path = possible_symlink;
-                strcpy(expanded_path, out);
-                if (strcmp(p, "") != 0) {
-                    strcat(expanded_path, "/");
-                    strcat(expanded_path, p);
+                if (target_is_user_absolute) {
+                    // expanded_path = symlink_target (user-absolute) [+ "/" + p]
+                    strcpy(expanded_path, c);
+                    if (strcmp(p, "") != 0) {
+                        strcat(expanded_path, "/");
+                        strcat(expanded_path, p);
+                    }
+                    return __path_normalize_with_prefix(
+                        NULL, expanded_path, out, flags, levels + 1,
+                        chroot_prefix, /*path_is_mount_absolute=*/false);
+                } else {
+                    // out currently ends with the symlink itself
+                    // (mount-absolute). Strip it back to the parent
+                    // dir; the readlink wrote the relative target into
+                    // `c` (the byte after the last '/'), so we point
+                    // the path concat right at it.
+                    strcpy(expanded_path, out);
+                    if (strcmp(p, "") != 0) {
+                        strcat(expanded_path, "/");
+                        strcat(expanded_path, p);
+                    }
+                    return __path_normalize_with_prefix(
+                        NULL, expanded_path, out, flags, levels + 1,
+                        chroot_prefix, /*path_is_mount_absolute=*/true);
                 }
-                // Recurse with the SAME chroot_prefix so multi-level
-                // absolute symlinks stay contained.
-                return __path_normalize_with_prefix(
-                    NULL, expanded_path, out, flags, levels + 1, chroot_prefix);
             }
 
             // if there's a slash after this component, ensure that if it
@@ -253,7 +285,7 @@ static int __path_normalize_with_prefix(const char *at_path, const char *path,
 
 // Back-compat wrapper for any in-tree caller (none currently).
 static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
-    return __path_normalize_with_prefix(at_path, path, out, flags, levels, NULL);
+    return __path_normalize_with_prefix(at_path, path, out, flags, levels, NULL, false);
 }
 
 // Hash a string into 24 bits — used to mix the chroot prefix into the
@@ -334,7 +366,8 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     }
 
     int result = __path_normalize_with_prefix(
-        at != NULL ? at_path : NULL, path, out, flags, 0, chroot_prefix);
+        at != NULL ? at_path : NULL, path, out, flags, 0,
+        chroot_prefix, /*path_is_mount_absolute=*/false);
 
     if (result == 0) {
         path_cache_set(full_input, cache_flags, out);
