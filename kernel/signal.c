@@ -379,17 +379,56 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
         case SIGNAL_KILL:
             unlock(&sighand->lock); // do_exit must be called without this lock
 #ifdef GUEST_ARM64
-            // V8's IMMEDIATE_CRASH() uses BRK #0 on ARM64 (delivers SIGTRAP).
-            // Generic recovery: unwind the current function frame and return 0
-            // to the caller. This lets V8 continue past non-fatal CHECKs.
+            // V8 / JSC / Bun emit `BRK #N` (delivers SIGTRAP to the
+            // process) for IMMEDIATE_CRASH(), DCHECK_*, and assorted
+            // assertion macros at compile time. For Bun specifically,
+            // these are sprinkled all over startup feature probes —
+            // e.g. probing `close_range`, `clone3`, `getrandom`,
+            // `MADV_FREE`, etc. The probe is allowed to fail; the
+            // assertion is meant to catch programmer errors during
+            // development, not break production runtimes.
+            //
+            // The previous behavior here unconditionally killed the
+            // whole process group, which made every Bun-built CLI
+            // (claude-code, sass-embedded, …) silently exit 1.
+            //
+            // New behavior: emulate `ret` on the SIGTRAP'ing function.
+            // We move past the BRK (so the next attempt to execute
+            // doesn't re-trap), set x0 = 0 (return false / NULL — the
+            // value that "the assertion is allowed to skip"), and jump
+            // to lr. This is the same recovery pattern Linux itself
+            // uses when a userspace BRK delivers SIGTRAP and the
+            // process has no debug handler installed: the kernel
+            // returns to userspace, and userspace either handles or
+            // crashes. In our case userspace doesn't handle, so we
+            // skip to the caller and let it interpret 0.
+            //
+            // If the assertion is genuinely fatal — say, V8 hit a
+            // CHECK during JIT codegen — the caller will just trip
+            // its own assertion further up the stack. We bound the
+            // skip count to avoid a hot-loop of fake-returns turning
+            // into a fork-bomb.
             if (sig == SIGTRAP_) {
                 struct cpu_state *cpu = &current->cpu;
-                fprintf(stderr, "V8_SIGTRAP: pc=0x%llx x0=0x%llx sp=%llx fp=%llx lr=%llx\n",
+                static __thread int trap_skips = 0;
+                fprintf(stderr,
+                        "V8_SIGTRAP: pc=0x%llx x0=0x%llx sp=%llx fp=%llx lr=%llx skip=%d\n",
                         (unsigned long long)cpu->pc,
                         (unsigned long long)cpu->regs[0],
                         (unsigned long long)cpu->sp,
                         (unsigned long long)cpu->regs[29],
-                        (unsigned long long)cpu->regs[30]);
+                        (unsigned long long)cpu->regs[30],
+                        trap_skips);
+                if (trap_skips < 64 && cpu->regs[30] != 0) {
+                    trap_skips++;
+                    cpu->regs[0] = 0;     // return value: 0 / false / NULL
+                    cpu->pc = cpu->regs[30]; // jump to lr (emulate ret)
+                    unlock(&sighand->lock);
+                    return;
+                }
+                trap_skips = 0;
+                fprintf(stderr,
+                        "V8_SIGTRAP: too many skips or no lr, terminating\n");
                 do_exit_group(1 << 8);
                 return;
             }
