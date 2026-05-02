@@ -358,7 +358,13 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 uint64_t last = atomic_load_explicit(
                     &current->group->last_progress_ns, memory_order_relaxed);
                 int64_t idle_s = (int64_t)(now_ns - last) / 1000000000LL;
-                if (idle_s >= 60) {
+                // 60s was too long for interactive use — npm/node and
+                // similar fork-heavy tools leave libuv worker pools
+                // sitting idle in epoll_wait after the main work is
+                // done. Drop to 10s so the parent gets unblocked
+                // quickly. has_live_children check still keeps
+                // legitimate long-running daemons safe.
+                if (idle_s >= 10) {
                     bool has_live_children = false;
                     int thread_count = 0;
                     lock(&pids_lock);

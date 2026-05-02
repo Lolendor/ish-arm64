@@ -261,9 +261,15 @@ noreturn void do_exit_group(int status) {
             printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still stuck → force kill\n",
                    current->pid, waited_ms, last_remaining);
 
-            // Signal stuck threads with SIGUSR1 repeatedly.
-            // Don't use pthread_cancel — it can corrupt malloc state if the
-            // thread is cancelled inside malloc/free.
+            // Try SIGUSR1 first (interrupts blocking syscalls without
+            // corrupting heap state). If after 3 rounds the thread is
+            // still alive — most likely because the host application
+            // re-enters the same syscall on EINTR (libuv worker pool
+            // does this for epoll_wait) — escalate to SIGTERM. SIGTERM
+            // is unmasked-by-default but doesn't have a libuv handler
+            // installed, so the host kernel kills the thread cleanly.
+            // Don't use pthread_cancel — it can corrupt malloc state if
+            // the thread is cancelled inside malloc/free.
             for (int attempt = 0; attempt < 3; attempt++) {
                 lock(&pids_lock);
                 lock(&group->lock);
@@ -281,6 +287,27 @@ noreturn void do_exit_group(int status) {
                 if (still_alive == 0) break;
                 struct timespec ts2 = {0, 50 * 1000000L};  // 50ms
                 nanosleep(&ts2, NULL);
+            }
+            // Escalation round: SIGTERM. node libuv re-arms epoll_wait
+            // on SIGUSR1 (it uses USR1 itself for its debug interface)
+            // but has no SIGTERM handler in worker threads, so the host
+            // pthread terminates and the wait4 in the parent unblocks.
+            for (int attempt = 0; attempt < 2; attempt++) {
+                lock(&pids_lock);
+                lock(&group->lock);
+                int still_alive = 0;
+                list_for_each_entry(&group->threads, task, group_links) {
+                    if (task != current && !task->exiting) {
+                        still_alive++;
+                        if (task->thread)
+                            pthread_kill(task->thread, SIGTERM);
+                    }
+                }
+                unlock(&group->lock);
+                unlock(&pids_lock);
+                if (still_alive == 0) break;
+                struct timespec ts3 = {0, 100 * 1000000L};  // 100ms
+                nanosleep(&ts3, NULL);
             }
 
             // If threads are truly stuck in uninterruptible host syscalls,
