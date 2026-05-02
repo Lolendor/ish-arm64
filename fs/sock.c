@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -37,6 +38,10 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
 
 int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     STRACE("socket(%d, %d, %d)", domain, type, protocol);
+    fprintf(stderr, "NETDIAG socket(pid=%d comm=%s domain=%d type=%d proto=%d)\n",
+           current ? current->pid : -1,
+           current ? current->comm : "?",
+           domain, type, protocol);
     int real_domain = sock_family_to_real(domain);
     if (real_domain < 0)
         return _EAFNOSUPPORT;
@@ -1538,26 +1543,51 @@ static bool sock_signal_pending(void) {
 static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
     int err;
     bool guest_nonblock = sock_fd_is_nonblock(fd);
+    int waits = 0;
     for (;;) {
         // Always try a non-blocking recv first. Using recv with
         // MSG_DONTWAIT instead of fcntl + read avoids racing with
         // other code that may toggle O_NONBLOCK on the host fd.
         ssize_t res = recv(fd->real_fd, buf, size, MSG_DONTWAIT);
-        if (res >= 0) { err = (int)res; break; }
+        if (res >= 0) {
+            err = (int)res;
+            if (waits > 0) {
+                fprintf(stderr, "NETDIAG sock_read(pid=%d comm=%s fd=%d real=%d size=%zu) waited %d times before %d bytes\n",
+                       current ? current->pid : -1,
+                       current ? current->comm : "?",
+                       -1, fd->real_fd, size, waits, err);
+            }
+            break;
+        }
         if (errno == EINTR) {
             if (sock_signal_pending()) { err = _EINTR; break; }
             continue;
         }
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             err = errno_map();
+            fprintf(stderr, "NETDIAG sock_read(pid=%d fd=%d) recv err=%d\n",
+                   current ? current->pid : -1, fd->real_fd, errno);
             break;
         }
         if (guest_nonblock) { err = _EAGAIN; break; }
 
+        if (waits == 0) {
+            fprintf(stderr, "NETDIAG sock_read-enter-wait(pid=%d comm=%s fd=%d size=%zu)\n",
+                   current ? current->pid : -1,
+                   current ? current->comm : "?",
+                   fd->real_fd, size);
+        }
+        waits++;
+
         // Block (with bounded poll) until data is available, the
         // socket gets hung up, or the SO_RCVTIMEO deadline expires.
         int wr = sock_wait_readable(fd->real_fd);
-        if (wr < 0) { err = wr; break; }
+        if (wr < 0) {
+            fprintf(stderr, "NETDIAG sock_read-wait-fail(pid=%d fd=%d wr=%d)\n",
+                   current ? current->pid : -1, fd->real_fd, wr);
+            err = wr;
+            break;
+        }
     }
     sock_translate_err(fd, &err);
     return err;
