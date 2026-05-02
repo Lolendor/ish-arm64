@@ -218,6 +218,50 @@ dword_t sys_close(fd_t f) {
     return f_close(f);
 }
 
+// Linux 5.9+ syscall: close every fd in [first, last] (inclusive).
+//
+//   flags & CLOSE_RANGE_UNSHARE  (1 << 1): caller wants a private
+//       copy of the fd table before closing. iSH's f_close already
+//       only touches current's table, so unshare is a no-op for us.
+//   flags & CLOSE_RANGE_CLOEXEC (1 << 2): set FD_CLOEXEC on the
+//       fds in the range instead of closing them.
+//
+// Many tools (Bun, modern Go, glibc 2.34+, anything that probes
+// the syscall and falls back to /proc/self/fd otherwise) try this
+// at startup; returning ENOSYS makes them either spin a SIGTRAP
+// debug-handler or fall back to a per-fd close loop. Implementing
+// it natively avoids both.
+#define CLOSE_RANGE_UNSHARE_ (1u << 1)
+#define CLOSE_RANGE_CLOEXEC_ (1u << 2)
+dword_t sys_close_range(dword_t first, dword_t last, dword_t flags) {
+    STRACE("close_range(%u, %u, %#x)", first, last, flags);
+    if (last < first) return _EINVAL;
+    if (flags & ~(CLOSE_RANGE_UNSHARE_ | CLOSE_RANGE_CLOEXEC_))
+        return _EINVAL;
+
+    struct fdtable *table = current->files;
+    lock(&table->lock);
+    unsigned hi = last;
+    if (hi >= table->size) hi = table->size > 0 ? table->size - 1 : 0;
+    for (unsigned f = first; f <= hi; f++) {
+        if (table->files[f] == NULL) continue;
+        if (flags & CLOSE_RANGE_CLOEXEC_) {
+            bit_set(f, table->cloexec);
+        } else {
+            // Inline what fdtable_close does so we don't drop the
+            // table lock between iterations.
+            struct fd *sfd = table->files[f];
+            table->files[f] = NULL;
+            bit_clear(f, table->cloexec);
+            unlock(&table->lock);
+            fd_close(sfd);
+            lock(&table->lock);
+        }
+    }
+    unlock(&table->lock);
+    return 0;
+}
+
 void fdtable_do_cloexec(struct fdtable *table) {
     lock(&table->lock);
     for (fd_t f = 0; (unsigned) f < table->size; f++)

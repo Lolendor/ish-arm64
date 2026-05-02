@@ -287,6 +287,13 @@ syscall_t syscall_table[] = {
     [289] = (syscall_t) syscall_stub, // pkey_alloc
     [290] = (syscall_t) syscall_stub, // pkey_free
     [291] = (syscall_t) sys_statx,
+    // gap from 292..435 — none of these have been needed yet, but
+    // sparse-init the array so the table still grows past 435.
+    [435] = (syscall_t) syscall_stub, // clone3
+    // close_range(2) was added in Linux 5.9. Bun (claude-code's
+    // packager) probes it at startup; without it the runtime falls
+    // back to a debug-trap loop and exits silently.
+    [436] = (syscall_t) sys_close_range,
 };
 
 #define NUM_SYSCALLS (sizeof(syscall_table) / sizeof(syscall_table[0]))
