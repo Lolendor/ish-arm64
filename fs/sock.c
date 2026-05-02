@@ -61,6 +61,49 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     }
 #endif
 
+    // For every TCP socket the guest opens, enable TCP keep-alive on
+    // the host with aggressive timing and ask the kernel not to send
+    // SIGPIPE on a dead peer (we surface EPIPE to the guest instead).
+    //
+    // Why: iOS's NAT64 / cellular network frequently drops idle TCP
+    // connections without sending RST. Without keep-alive, the guest's
+    // blocking read() on a dead socket waits forever — visible as
+    // curl/wget hanging on "awaiting response" against Cloudflare and
+    // similar CDNs that hold the connection open after sending headers.
+    //
+    // Defaults below try to detect a dead peer within ~30s without
+    // being so aggressive that healthy long-lived connections (sshd,
+    // database) get torn down. Guest can still override via
+    // setsockopt(TCP_KEEPIDLE/INTVL/CNT).
+    if (real_type == SOCK_STREAM) {
+        int one = 1;
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+        // BSD/macOS-only: silence SIGPIPE on dead peer.
+        setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+#if defined(TCP_KEEPALIVE)
+        // macOS: SECONDS until first probe.
+        int keepalive_secs = 15;
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPALIVE,
+                   &keepalive_secs, sizeof(keepalive_secs));
+#elif defined(TCP_KEEPIDLE)
+        int keepidle = 15;
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE,
+                   &keepidle, sizeof(keepidle));
+#endif
+#ifdef TCP_KEEPINTVL
+        int keepintvl = 5;
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL,
+                   &keepintvl, sizeof(keepintvl));
+#endif
+#ifdef TCP_KEEPCNT
+        int keepcnt = 3;
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,
+                   &keepcnt, sizeof(keepcnt));
+#endif
+    }
+
     fd_t f = sock_fd_create(sock, domain, type, protocol);
     if (f < 0)
         close(sock);
@@ -1460,44 +1503,61 @@ static void sock_translate_err(struct fd *fd, int *err) {
     }
 }
 
-// sock_read / sock_write: behave exactly like realfs_read / realfs_write
-// (a single host read/write call, with no poll and no flag change), except
-// that EINTR is handled specially: if there is a guest signal pending, we
-// surface EINTR back to the guest instead of blindly retrying.
+// sock_read / sock_write: route read()/write() on a guest socket fd
+// through a poll-then-nonblock-syscall pattern.
 //
-// The original realfs_read/realfs_write does `while (errno == EINTR) retry`,
-// which swallows the SIGUSR1 wake iSH uses to deliver guest signals into
-// blocked host syscalls. Combined with iOS occasionally deferring signal
-// delivery (thread suspension on backgrounding), this causes indefinite
-// hangs on any blocking socket read/write (git HTTPS, nc, telnet, etc.).
+// The original realfs_read does a plain blocking host read(). On iOS,
+// the host thread can be suspended (app backgrounding, scheduler
+// quirks) at the exact moment a blocking read() is parked inside the
+// kernel waiting for a TCP segment, and the kernel then never wakes us
+// even when data arrives. The visible symptom is curl/wget/git
+// hanging on "HTTP request sent, awaiting response..." forever,
+// despite the host being able to receive the data on the same socket
+// (apk works because libfetch uses recv() which we already bounded
+// inside sys_recvfrom).
 //
-// We intentionally do NOT poll, do NOT mess with nonblock flags, and do NOT
-// switch to recv/send. This minimizes regression risk — the host I/O path
-// is byte-for-byte identical to the original implementation for every case
-// except "host syscall got EINTR AND guest has a pending signal", which is
-// precisely the bug we need to fix.
+// Fix: drive the read/write the same way sys_recvfrom does. Try a
+// MSG_DONTWAIT-equivalent first; on EAGAIN, sock_wait_for() polls
+// with a 1-second cap so signal pending checks happen regularly. We
+// honor the guest fd's O_NONBLOCK exactly: if the guest set the fd
+// non-blocking, we never wait.
+static bool sock_fd_is_nonblock(struct fd *fd) {
+    if ((fd->flags & O_NONBLOCK_) != 0) return true;
+    int hf = fcntl(fd->real_fd, F_GETFL, 0);
+    return hf >= 0 && (hf & O_NONBLOCK);
+}
+
+static bool sock_signal_pending(void) {
+    if (current->sighand == NULL) return false;
+    lock(&current->sighand->lock);
+    bool pending = !!(current->pending & ~current->blocked);
+    unlock(&current->sighand->lock);
+    return pending;
+}
+
 static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
     int err;
-    int eintr_count = 0;
+    bool guest_nonblock = sock_fd_is_nonblock(fd);
     for (;;) {
-        ssize_t res = read(fd->real_fd, buf, size);
+        // Always try a non-blocking recv first. Using recv with
+        // MSG_DONTWAIT instead of fcntl + read avoids racing with
+        // other code that may toggle O_NONBLOCK on the host fd.
+        ssize_t res = recv(fd->real_fd, buf, size, MSG_DONTWAIT);
         if (res >= 0) { err = (int)res; break; }
-        if (errno != EINTR) { err = errno_map(); break; }
-        eintr_count++;
-        // EINTR: only surface to guest if there is actually a pending signal
-        // that the guest wants to handle. Otherwise retry (matches the
-        // original realfs_read behavior for spurious EINTR).
-        if (current->sighand != NULL) {
-            lock(&current->sighand->lock);
-            bool pending = !!(current->pending & ~current->blocked);
-            unlock(&current->sighand->lock);
-            if (pending) { err = _EINTR; break; }
+        if (errno == EINTR) {
+            if (sock_signal_pending()) { err = _EINTR; break; }
+            continue;
         }
-        // no guest signal — retry the host read
-    }
-    if (eintr_count >= 3) {
-        printk("NETDIAG sock_read-eintr(pid=%d comm=%s fd=%d) count=%d err=%d\n",
-               current->pid, current->comm, fd->real_fd, eintr_count, err);
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            err = errno_map();
+            break;
+        }
+        if (guest_nonblock) { err = _EAGAIN; break; }
+
+        // Block (with bounded poll) until data is available, the
+        // socket gets hung up, or the SO_RCVTIMEO deadline expires.
+        int wr = sock_wait_readable(fd->real_fd);
+        if (wr < 0) { err = wr; break; }
     }
     sock_translate_err(fd, &err);
     return err;
@@ -1505,22 +1565,26 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
 
 static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
     int err;
-    int eintr_count = 0;
+    bool guest_nonblock = sock_fd_is_nonblock(fd);
     for (;;) {
-        ssize_t res = write(fd->real_fd, buf, size);
+        ssize_t res = send(fd->real_fd, buf, size, MSG_DONTWAIT
+#ifdef MSG_NOSIGNAL
+                                                   | MSG_NOSIGNAL
+#endif
+                          );
         if (res >= 0) { err = (int)res; break; }
-        if (errno != EINTR) { err = errno_map(); break; }
-        eintr_count++;
-        if (current->sighand != NULL) {
-            lock(&current->sighand->lock);
-            bool pending = !!(current->pending & ~current->blocked);
-            unlock(&current->sighand->lock);
-            if (pending) { err = _EINTR; break; }
+        if (errno == EINTR) {
+            if (sock_signal_pending()) { err = _EINTR; break; }
+            continue;
         }
-    }
-    if (eintr_count >= 3) {
-        printk("NETDIAG sock_write-eintr(pid=%d comm=%s fd=%d) count=%d err=%d\n",
-               current->pid, current->comm, fd->real_fd, eintr_count, err);
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            err = errno_map();
+            break;
+        }
+        if (guest_nonblock) { err = _EAGAIN; break; }
+
+        int wr = sock_wait_for(fd->real_fd, POLLOUT, SO_SNDTIMEO);
+        if (wr < 0) { err = wr; break; }
     }
     sock_translate_err(fd, &err);
     return err;
