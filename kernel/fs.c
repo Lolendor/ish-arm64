@@ -584,11 +584,35 @@ dword_t sys_getcwd(addr_t buf_addr, dword_t size) {
     STRACE("getcwd(%#x, %#x)", buf_addr, size);
     lock(&current->fs->lock);
     struct fd *wd = current->fs->pwd;
+    struct fd *chroot_root = current->fs->root;
     char pwd[MAX_PATH + 1];
     int err = generic_getpath(wd, pwd);
+    char chroot_path[MAX_PATH + 1] = "/";
+    if (err >= 0 && chroot_root != NULL)
+        (void)generic_getpath(chroot_root, chroot_path);
     unlock(&current->fs->lock);
     if (err < 0)
         return err;
+
+    // Strip the chroot root prefix from pwd so the guest sees a virtual
+    // filesystem that starts at "/", just like a real chroot would.
+    // Examples (with chroot_path = "/srv/vms/test"):
+    //   pwd="/srv/vms/test"        -> "/"
+    //   pwd="/srv/vms/test/root"   -> "/root"
+    //   pwd="/srv/vms"             -> "/"   (defensive — clamp)
+    if (strcmp(chroot_path, "/") != 0) {
+        size_t cl = strlen(chroot_path);
+        if (strncmp(pwd, chroot_path, cl) == 0 &&
+            (pwd[cl] == '\0' || pwd[cl] == '/')) {
+            // Move the suffix down to the start.
+            memmove(pwd, pwd + cl, strlen(pwd) - cl + 1);
+            if (pwd[0] == '\0') strcpy(pwd, "/");
+        } else {
+            // Defensive: if pwd somehow drifted outside the chroot,
+            // clamp to "/".
+            strcpy(pwd, "/");
+        }
+    }
 
     if (strlen(pwd) + 1 > size)
         return _ERANGE;

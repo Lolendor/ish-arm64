@@ -101,7 +101,15 @@ static void path_cache_set(const char *full_path, int flags, const char *normali
     entry->valid = true;
 }
 
-static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
+// chroot_floor: minimum byte offset within `out` that `..` is not
+// allowed to back below. If 0, `..` from `/` collapses to `/` as
+// usual. If >0 (when at_path is the current chroot root), `..` from
+// the chroot root stays at the chroot root, matching the POSIX
+// behaviour of a real chroot. See path_normalize() for how this is
+// derived.
+static int __path_normalize_with_floor(const char *at_path, const char *path,
+                                       char *out, int flags, int levels,
+                                       int chroot_floor) {
     // you must choose one
     if (flags & N_SYMLINK_FOLLOW)
         assert(!(flags & N_SYMLINK_NOFOLLOW));
@@ -134,12 +142,16 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
                     p++;
                 continue;
             } else if (p[1] == '.' && (p[2] == '\0' || p[2] == '/')) {
-                // double dot path component, delete the last component
-                if (o != out) {
+                // double dot path component, delete the last component,
+                // but never back below chroot_floor (chroot containment).
+                if ((o - out) > chroot_floor) {
                     do {
                         o--;
                         n++;
-                    } while (*o != '/');
+                    } while ((o - out) > chroot_floor && *o != '/');
+                    // if we landed on the floor and it points at the
+                    // boundary slash, leave it there (so further /-eats
+                    // work normally)
                 }
                 p += 2;
                 while (*p == '/')
@@ -188,7 +200,12 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
                     strcat(expanded_path, "/");
                     strcat(expanded_path, p);
                 }
-                return __path_normalize(NULL, expanded_path, out, flags, levels + 1);
+                // For symlink expansion, chroot containment is enforced
+                // by the caller's `at_path` (passed through path_normalize),
+                // not by this recursive resolution step. We still pass
+                // chroot_floor=0 because the resolved buffer is now
+                // absolute and floor would no longer match its prefix.
+                return __path_normalize_with_floor(NULL, expanded_path, out, flags, levels + 1, 0);
             }
 
             // if there's a slash after this component, ensure that if it
@@ -216,13 +233,24 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
     return 0;
 }
 
+// Back-compat wrapper for any in-tree caller (none currently).
+static int __path_normalize(const char *at_path, const char *path, char *out, int flags, int levels) {
+    return __path_normalize_with_floor(at_path, path, out, flags, levels, 0);
+}
+
 int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     assert(at != NULL);
     if (strcmp(path, "") == 0)
         return _ENOENT;
 
-    // start with root or cwd, depending on whether it starts with a slash
+    // start with root or cwd, depending on whether it starts with a slash.
+    // Capture the chroot root path so __path_normalize can clamp `..` at
+    // the chroot boundary (otherwise `cd ..` from `/` inside a chroot
+    // would happily walk out of the jail because resolution happens in
+    // mount-absolute terms).
+    struct fd *chroot_root_fd;
     lock(&current->fs->lock);
+    chroot_root_fd = current->fs->root;
     if (path[0] == '/')
         at = current->fs->root;
     else if (at == AT_PWD)
@@ -237,6 +265,19 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         assert(path_is_normalized(at_path));
     }
 
+    // Determine the chroot floor: the byte length of the chroot root's
+    // mount-absolute path, or 0 if the process is at the real fs root.
+    // We only enforce the floor when the resolution is rooted at the
+    // chroot dir (path starts with '/' OR the relative `at` is inside).
+    int chroot_floor = 0;
+    if (chroot_root_fd != NULL) {
+        char chroot_path[MAX_PATH];
+        if (generic_getpath(chroot_root_fd, chroot_path) == 0
+                && strcmp(chroot_path, "/") != 0) {
+            chroot_floor = (int)strlen(chroot_path);
+        }
+    }
+
     // Build full input path for cache lookup
     char full_input[MAX_PATH];
     if (at != NULL && strcmp(at_path, "/") != 0) {
@@ -246,18 +287,19 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         full_input[MAX_PATH - 1] = '\0';
     }
 
-    // Try cache lookup first
-    if (path_cache_get(full_input, flags, out) == 0) {
-        // Cache hit - fast return
+    // Try cache lookup first. We bake the chroot_floor into the cache
+    // key (via flags' high bits) so different jails don't collide.
+    int cache_flags = flags | (chroot_floor << 16);
+    if (path_cache_get(full_input, cache_flags, out) == 0) {
         return 0;
     }
 
-    // Cache miss - do full normalization
-    int result = __path_normalize(at != NULL ? at_path : NULL, path, out, flags, 0);
+    // Cache miss - do full normalization with chroot containment.
+    int result = __path_normalize_with_floor(
+        at != NULL ? at_path : NULL, path, out, flags, 0, chroot_floor);
 
-    // Store result in cache (even on error, we cache the error)
     if (result == 0) {
-        path_cache_set(full_input, flags, out);
+        path_cache_set(full_input, cache_flags, out);
     }
 
     return result;
