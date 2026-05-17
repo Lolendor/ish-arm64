@@ -13,6 +13,7 @@
 #include <poll.h>
 
 #include "debug.h"
+#include "misc.h"
 #include "kernel/errno.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
@@ -95,6 +96,14 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
     struct fd *fd = fd_create(&realfs_fdops);
     fd->real_fd = fd_no;
     fd->dir = NULL;
+
+    /* Bind-mount change tracker: any open that may modify the file fires an
+     * upsert event. The hook is intentionally agnostic about path layout —
+     * we just emit whatever path realfs received. The Swift consumer
+     * decides whether the path is one it cares about. */
+    if (flags & (O_CREAT_ | O_TRUNC_ | O_WRONLY_ | O_RDWR_ | O_APPEND_)) {
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
+    }
     return fd;
 }
 
@@ -444,6 +453,7 @@ int realfs_unlink(struct mount *mount, const char *path) {
     int res = unlinkat(mount->root_fd, fix_path(path), 0);
     if (res < 0)
         return errno_map();
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     return res;
 }
 
@@ -451,6 +461,7 @@ int realfs_rmdir(struct mount *mount, const char *path) {
     int err = unlinkat(mount->root_fd, fix_path(path), AT_REMOVEDIR);
     if (err < 0)
         return errno_map();
+    fakefs_record_change(path, FAKEFS_CHANGE_OP_UNLINK);
     return 0;
 }
 
@@ -487,11 +498,16 @@ static int unlinkat_recursive(int parent_fd, const char *name) {
 
 int realfs_rename(struct mount *mount, const char *src, const char *dst) {
     const char *src_fixed = fix_path(src);
-    int err = renameat(mount->root_fd,
-                       src_fixed,
-                       mount->root_fd, fix_path(dst));
-    if (err == 0)
+    const char *dst_fixed = fix_path(dst);
+    int err = renameat(mount->root_fd, src_fixed,
+                       mount->root_fd, dst_fixed);
+    if (err == 0) {
+        // Source is gone, destination appeared. Emit two events; the
+        // Swift consumer filters paths it doesn't care about.
+        fakefs_record_change(src, FAKEFS_CHANGE_OP_UNLINK);
+        fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
         return 0;
+    }
     int saved = errno;
 
     // Linux's renameat() atomically replaces dst if both src and dst are
@@ -509,7 +525,6 @@ int realfs_rename(struct mount *mount, const char *src, const char *dst) {
     // dereferences relative paths against the mount root); racey writers
     // can't trick this into removing something outside the mount.
     if (saved == ENOTEMPTY || saved == EEXIST) {
-        const char *dst_fixed = fix_path(dst);
         struct stat src_st, dst_st;
         if (fstatat(mount->root_fd, src_fixed, &src_st,
                     AT_SYMLINK_NOFOLLOW) == 0
@@ -520,8 +535,11 @@ int realfs_rename(struct mount *mount, const char *src, const char *dst) {
             int rm_err = unlinkat_recursive(mount->root_fd, dst_fixed);
             if (rm_err == 0) {
                 if (renameat(mount->root_fd, src_fixed,
-                             mount->root_fd, dst_fixed) == 0)
+                             mount->root_fd, dst_fixed) == 0) {
+                    fakefs_record_change(src, FAKEFS_CHANGE_OP_UNLINK);
+                    fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
                     return 0;
+                }
                 saved = errno;
             }
         }
@@ -563,6 +581,8 @@ int realfs_truncate(struct mount *mount, const char *path, off_t_ size) {
     if (ftruncate(fd, size) < 0)
         err = errno_map();
     close(fd);
+    if (err == 0)
+        fakefs_record_change(path, FAKEFS_CHANGE_OP_TRUNCATE);
     return err;
 }
 
@@ -698,6 +718,8 @@ ssize_t realfs_ioctl_size(int cmd) {
         return sizeof(dword_t);
     if (cmd == TCGETS_)
         return sizeof(struct termios_);
+    if (cmd == TCSETS_ || cmd == TCSETSW_ || cmd == TCSETSF_)
+        return sizeof(struct termios_);
     if (cmd == TIOCGWINSZ_)
         return sizeof(struct winsize_);
     return -1;
@@ -744,6 +766,34 @@ int realfs_ioctl(struct fd *fd, int cmd, void *arg) {
             }
             return _ENOTTY;
         }
+        case TCSETS_:
+        case TCSETSW_:
+        case TCSETSF_:
+            if (ish_exec_trace())
+                fprintf(stderr, "TCSETS_DBG: fd=%d cmd=0x%x real_fd=%d isatty=%d\n",
+                        fd->real_fd, cmd, fd->real_fd, isatty(fd->real_fd));
+            // Node 22's ResetStdio() calls tcsetattr() on any fd it
+            // previously saw as a TTY (via uv_guess_handle → TCGETS).
+            // For piped stdio backed by a host TTY, apply the termios to
+            // the host fd so terminal mode restoration actually takes
+            // effect. For anything else, succeed silently — Node will
+            // CHECK() on errors other than 0 / -EPERM.
+            if (isatty(fd->real_fd)) {
+                struct termios_ *guest = (struct termios_ *)arg;
+                struct termios host_termios = {0};
+                if (tcgetattr(fd->real_fd, &host_termios) == 0) {
+                    host_termios.c_iflag = guest->iflags;
+                    host_termios.c_oflag = guest->oflags;
+                    host_termios.c_cflag = guest->cflags;
+                    host_termios.c_lflag = guest->lflags;
+                    int how = (cmd == TCSETSW_) ? TCSADRAIN
+                            : (cmd == TCSETSF_) ? TCSAFLUSH
+                            : TCSANOW;
+                    (void)tcsetattr(fd->real_fd, how, &host_termios);
+                }
+                return 0;
+            }
+            return 0;
     }
     return _ENOTTY;
 }

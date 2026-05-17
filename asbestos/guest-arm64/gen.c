@@ -115,6 +115,56 @@ extern void gadget_adds_reg_64_nshift(void);
 extern void gadget_subs_reg_64_nshift(void);
 extern void gadget_add_reg_64_nshift(void);
 extern void gadget_sub_reg_64_nshift(void);
+extern void gadget_and_reg_64_nshift(void);
+extern void gadget_orr_reg_64_nshift(void);
+extern void gadget_eor_reg_64_nshift(void);
+extern void gadget_add_reg_32_nshift(void);
+extern void gadget_sub_reg_32_nshift(void);
+extern void gadget_and_reg_32_nshift(void);
+extern void gadget_orr_reg_32_nshift(void);
+extern void gadget_eor_reg_32_nshift(void);
+extern void gadget_lsl_imm_32(void);
+extern void gadget_lsl_imm_64(void);
+extern void gadget_lsr_imm_32(void);
+extern void gadget_lsr_imm_64(void);
+extern void gadget_asr_imm_32(void);
+extern void gadget_asr_imm_64(void);
+extern void gadget_adds_reg_32_nshift(void);
+extern void gadget_subs_reg_32_nshift(void);
+extern void gadget_and_imm_64_simple(void);
+extern void gadget_and_imm_32_simple(void);
+extern void gadget_ands_imm_64(void);
+extern void gadget_ands_imm_32(void);
+extern void gadget_load8_imm_signed_fast(void);
+extern void gadget_load16_imm_signed_fast(void);
+extern void gadget_load32_imm_signed_fast(void);
+extern void gadget_load64_imm_signed_fast(void);
+extern void gadget_store8_imm_signed_fast(void);
+extern void gadget_store16_imm_signed_fast(void);
+extern void gadget_store32_imm_signed_fast(void);
+extern void gadget_store64_imm_signed_fast(void);
+extern void gadget_load64_reg_fast(void);
+extern void gadget_load32_reg_fast(void);
+extern void gadget_ldp64_imm_preidx_fast(void);
+extern void gadget_ldp64_imm_postidx_fast(void);
+extern void gadget_stp64_imm_preidx_fast(void);
+extern void gadget_stp64_imm_postidx_fast(void);
+extern void gadget_ldp64_imm_preidx_sp(void);
+extern void gadget_ldp64_imm_postidx_sp(void);
+extern void gadget_stp64_imm_preidx_sp(void);
+extern void gadget_stp64_imm_postidx_sp(void);
+extern void gadget_ldr64_imm_preidx_fast(void);
+extern void gadget_ldr64_imm_postidx_fast(void);
+extern void gadget_ldr32_imm_preidx_fast(void);
+extern void gadget_ldr32_imm_postidx_fast(void);
+extern void gadget_str64_imm_preidx_fast(void);
+extern void gadget_str64_imm_postidx_fast(void);
+extern void gadget_str32_imm_preidx_fast(void);
+extern void gadget_str32_imm_postidx_fast(void);
+extern void gadget_str64_xzr_imm_preidx_fast(void);
+extern void gadget_str64_xzr_imm_postidx_fast(void);
+extern void gadget_str32_xzr_imm_preidx_fast(void);
+extern void gadget_str32_xzr_imm_postidx_fast(void);
 
 // Per-condition bcond gadgets
 extern void gadget_bcond_eq(void);
@@ -1059,6 +1109,11 @@ static void *fused_cmp32_bcond_gadgets[14];
 static void *fused_subs32_bcond_gadgets[14];
 static void *fused_cmp_reg_bcond_gadgets[14];
 static void *fused_subs_reg_bcond_gadgets[14];
+// AND_imm + CMP_imm + B.cond — 14-slot table indexed by condition.
+// Slots for mi/pl/vs/vc are NULL because emitting fused gadgets for them
+// changes meaning when the AND result drives N/V (signed comparison) —
+// keep those as the unfused 2-gadget path.
+static void *fused_and_cmp32_bcond_gadgets[14];
 static bool fused_bcond_tables_init = false;
 
 static void init_fused_bcond_tables(void) {
@@ -1149,6 +1204,27 @@ static void init_fused_bcond_tables(void) {
     fused_subs_reg_bcond_gadgets[11] = gadget_fused_subs_reg_bcond_lt;
     fused_subs_reg_bcond_gadgets[12] = gadget_fused_subs_reg_bcond_gt;
     fused_subs_reg_bcond_gadgets[13] = gadget_fused_subs_reg_bcond_le;
+    // 32-bit AND_imm + CMP_imm + B.cond (subset of conditions)
+    extern void gadget_fused_and_cmp32_bcond_eq(void);
+    extern void gadget_fused_and_cmp32_bcond_ne(void);
+    extern void gadget_fused_and_cmp32_bcond_cs(void);
+    extern void gadget_fused_and_cmp32_bcond_cc(void);
+    extern void gadget_fused_and_cmp32_bcond_hi(void);
+    extern void gadget_fused_and_cmp32_bcond_ls(void);
+    extern void gadget_fused_and_cmp32_bcond_ge(void);
+    extern void gadget_fused_and_cmp32_bcond_lt(void);
+    extern void gadget_fused_and_cmp32_bcond_gt(void);
+    extern void gadget_fused_and_cmp32_bcond_le(void);
+    fused_and_cmp32_bcond_gadgets[0]  = gadget_fused_and_cmp32_bcond_eq;
+    fused_and_cmp32_bcond_gadgets[1]  = gadget_fused_and_cmp32_bcond_ne;
+    fused_and_cmp32_bcond_gadgets[2]  = gadget_fused_and_cmp32_bcond_cs;
+    fused_and_cmp32_bcond_gadgets[3]  = gadget_fused_and_cmp32_bcond_cc;
+    fused_and_cmp32_bcond_gadgets[8]  = gadget_fused_and_cmp32_bcond_hi;
+    fused_and_cmp32_bcond_gadgets[9]  = gadget_fused_and_cmp32_bcond_ls;
+    fused_and_cmp32_bcond_gadgets[10] = gadget_fused_and_cmp32_bcond_ge;
+    fused_and_cmp32_bcond_gadgets[11] = gadget_fused_and_cmp32_bcond_lt;
+    fused_and_cmp32_bcond_gadgets[12] = gadget_fused_and_cmp32_bcond_gt;
+    fused_and_cmp32_bcond_gadgets[13] = gadget_fused_and_cmp32_bcond_le;
     fused_bcond_tables_init = true;
 }
 
@@ -1411,6 +1487,69 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
             return 0;
         }
 
+        // 3-instruction peephole: AND wd, wn, #mask  +  CMP wd, #imm12  +  B.cond
+        // Most common pair across CPython workloads (~4.5% of dispatches).
+        // Conditions: 32-bit (sf=0), opc=0, rn!=31, rd!=31, follow-up CMP wd,#imm12
+        // (sf=0, op=1, S=1, rd=31), follow-up B.cond with cond ∈ supported set.
+        if (opc == 0 && !sf && rn != 31 && rd != 31) {
+            uint32_t cmp_insn, br_insn;
+            if (gen_peek_next_insn(state, &cmp_insn)) {
+                // CMP Wn, #imm12: SUBS WZR, Wn, #imm12  (32-bit, op=1, S=1, sh=0, rd=31, rn=rd_of_AND)
+                // Encoding: 0 1 1 1 0 0 0 1 0 sh imm12 Rn Rd  → sf=0, op=1, S=1, opc_top=10001 → 0x71000000
+                if ((cmp_insn & 0xff800000) == 0x71000000) {
+                    uint32_t cmp_sh = (cmp_insn >> 22) & 1;
+                    uint32_t cmp_rd = cmp_insn & 0x1f;
+                    uint32_t cmp_rn = (cmp_insn >> 5) & 0x1f;
+                    uint32_t cmp_imm = (cmp_insn >> 10) & 0xfff;
+                    if (!cmp_sh && cmp_rd == 31 && cmp_rn == rd) {
+                        // Peek 2nd insn (B.cond)
+                        addr_t br_ip = state->ip + 4;
+                        if (tlb_read(state->tlb, br_ip, &br_insn, sizeof(br_insn)) &&
+                            (br_insn & 0xff000010) == 0x54000000) {
+                            uint32_t cond = br_insn & 0xf;
+                            init_fused_bcond_tables();
+                            void *g = (cond < 14) ? fused_and_cmp32_bcond_gadgets[cond] : NULL;
+                            if (g != NULL) {
+                                int64_t br_off = arm64_branch_imm19(br_insn);
+                                addr_t target = br_ip + br_off;
+                                addr_t ft_addr = state->ip + 8;
+                                unsigned long fake_target      = (unsigned long)target | (1UL << 63);
+                                unsigned long fake_fallthrough = (unsigned long)ft_addr | (1UL << 63);
+                                state->ip += 8;  // consume CMP + B.cond
+                                gen(state, (unsigned long) g);
+                                gen(state, (uint64_t)rd | ((uint64_t)rn << 5) | ((uint64_t)cmp_imm << 10));
+                                gen(state, imm & 0xffffffffULL);  // 32-bit AND mask
+                                gen(state, fake_target);
+                                gen(state, fake_fallthrough);
+                                state->jump_ip[0] = state->size - 2;
+                                state->jump_ip[1] = state->size - 1;
+                                return 0;  // block ended (branch)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fast path: AND immediate, no flag setting (opc=0), rn != 31, rd != 31.
+        // Hot for PyObject tag/flag bit masking. ~30 → ~10 inline insns.
+        if (opc == 0 && rn != 31 && rd != 31) {
+            gen(state, (unsigned long)(sf ? gadget_and_imm_64_simple : gadget_and_imm_32_simple));
+            gen(state, rd | ((uint64_t)rn << 8));
+            gen(state, imm);
+            return 1;
+        }
+
+        // Fast path: ANDS immediate (opc=3, flag-setting), rn != 31.
+        // rd=31 (TST instruction) is allowed and handled inside the gadget.
+        // Common in CPython tag-bit tests: `if (Py_TYPE(o)->tp_flags & Py_TPFLAGS_X)`.
+        if (opc == 3 && rn != 31) {
+            gen(state, (unsigned long)(sf ? gadget_ands_imm_64 : gadget_ands_imm_32));
+            gen(state, rd | ((uint64_t)rn << 8));
+            gen(state, imm);
+            return 1;
+        }
+
         void *gadget;
         switch (opc) {
             case 0: gadget = gadget_and_imm; break;  // AND
@@ -1473,6 +1612,38 @@ static int gen_dp_imm(struct gen_state *state, uint32_t insn) {
         uint64_t fused_param = immr | (imms << 8) | ((uint64_t)sf << 16)
                               | ((uint64_t)rn << 20) | ((uint64_t)rd << 28);
         bool can_fuse = (rn != 31 && rd != 31 && opc != 1);
+
+        // Recognize LSL/LSR/ASR immediate aliases of UBFM/SBFM and emit a
+        // single-instruction gadget instead of the generic bitfield extractor.
+        // ARM ARM aliases:
+        //   LSL Rd, Rn, #s : UBFM imms = size-1-s, immr = (-s) mod size, imms<immr-1
+        //   LSR Rd, Rn, #s : UBFM imms = size-1, immr = s
+        //   ASR Rd, Rn, #s : SBFM imms = size-1, immr = s
+        if (can_fuse) {
+            uint32_t size = sf ? 64 : 32;
+            uint32_t shift_pkt = ((uint64_t)rd) | ((uint64_t)rn << 8);
+            // LSR / ASR: imms == size-1
+            if (imms == size - 1) {
+                if (opc == 2) {  // UBFM → LSR
+                    gen(state, (unsigned long)(sf ? gadget_lsr_imm_64 : gadget_lsr_imm_32));
+                    gen(state, shift_pkt | ((uint64_t)immr << 16));
+                    return 1;
+                }
+                if (opc == 0) {  // SBFM → ASR
+                    gen(state, (unsigned long)(sf ? gadget_asr_imm_64 : gadget_asr_imm_32));
+                    gen(state, shift_pkt | ((uint64_t)immr << 16));
+                    return 1;
+                }
+            }
+            // LSL #s alias: UBFM with immr = size-s, imms = size-1-s, i.e. immr == imms+1
+            // Excludes shift==0 (which would have immr=0,imms=-1 — never encoded).
+            if (opc == 2 && immr == imms + 1 && immr <= size - 1) {
+                uint32_t shift = size - immr;
+                gen(state, (unsigned long)(sf ? gadget_lsl_imm_64 : gadget_lsl_imm_32));
+                gen(state, shift_pkt | ((uint64_t)shift << 16));
+                return 1;
+            }
+        }
 
         // Handle SBFM (opc=0) and UBFM (opc=2) with fused fast path
         if (opc == 0) {
@@ -2261,6 +2432,19 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
 
         if (use_fused_reg) {
             uint64_t fused_param = rt | ((uint64_t)rn << 8) | ((uint64_t)rm << 16) | ((uint64_t)shift << 24);
+            // Fast path: 32/64-bit non-sign-extending loads, all regs != 31.
+            // Saves ~6 inline branches by skipping XZR/SP checks.
+            bool fast_load = is_load && !sign_extend && rn != 31 && rm != 31 && rt != 31;
+            if (fast_load && size == 3) {
+                gen(state, (unsigned long) gadget_load64_reg_fast);
+                gen(state, fused_param);
+                return 1;
+            }
+            if (fast_load && size == 2) {
+                gen(state, (unsigned long) gadget_load32_reg_fast);
+                gen(state, fused_param);
+                return 1;
+            }
 
             if (is_load) {
                 void *gadget;
@@ -2444,6 +2628,45 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             return 1;
         }
 
+        // Pre/post-indexed fast path, SP-base (rn == 31): function prologue/epilogue
+        // STP X29, X30, [SP, #-N]! and LDP X29, X30, [SP], #N. Common in nearly every
+        // guest binary; the generic 3-gadget path is the largest single hot pair on
+        // Python workloads.
+        // For LDP-postidx, ARM ARM forbids rt or rt2 == rn (SP); checks unnecessary.
+        // For STP we accept any rt/rt2 (including XZR, gadget zeros it).
+        if (is64 && rn == 31) {
+            int32_t off32 = (int32_t)offset;
+            uint64_t param = (uint64_t)(rt & 0x1f)
+                           | ((uint64_t)(rt2 & 0x1f) << 8)
+                           | (((uint64_t)(uint32_t)off32) << 16);
+            void *gadget;
+            if (L) gadget = is_pre ? gadget_ldp64_imm_preidx_sp : gadget_ldp64_imm_postidx_sp;
+            else   gadget = is_pre ? gadget_stp64_imm_preidx_sp : gadget_stp64_imm_postidx_sp;
+            gen(state, (unsigned long) gadget);
+            gen(state, param);
+            return 1;
+        }
+
+        // Pre/post-indexed fast path: rn != 31, rt != 31, rt2 != 31, 64-bit only.
+        // To preserve ARM "writeback after access" semantics for post-indexed
+        // ldp where rt or rt2 == rn (writeback overrides loaded value), we
+        // restrict the fast path to disjoint dest/base registers and let the
+        // generic 3-gadget sequence handle the overlap case.
+        if (is64 && rn != 31 && rt != 31 && rt2 != 31 &&
+            rn != rt && rn != rt2) {
+            int16_t off16 = (int16_t)offset;
+            uint64_t param = (uint64_t)(rt & 0x1f)
+                           | ((uint64_t)(rt2 & 0x1f) << 8)
+                           | ((uint64_t)(rn & 0x1f) << 16)
+                           | (((uint64_t)(uint16_t)off16) << 24);
+            void *gadget;
+            if (L) gadget = is_pre ? gadget_ldp64_imm_preidx_fast : gadget_ldp64_imm_postidx_fast;
+            else   gadget = is_pre ? gadget_stp64_imm_preidx_fast : gadget_stp64_imm_postidx_fast;
+            gen(state, (unsigned long) gadget);
+            gen(state, param);
+            return 1;
+        }
+
         // Pre/post-indexed: use separate calc_addr + ldp/stp + writeback
 
         // Step 1: Calculate address
@@ -2575,6 +2798,76 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
         bool is_pre_indexed = (mode == 3);
         bool is_unscaled = (mode == 0);  // STUR/LDUR - offset applied, no writeback
         bool is_load = (opc == 1) || (opc == 2) || (opc == 3);
+        bool sign_extend_byte_or_half = (opc >= 2) && size < 2;
+
+        // Fast path: unscaled imm form (LDUR/STUR), no writeback, no XZR/SP,
+        // no sign-extend on byte/halfword. Emits a single fused gadget that
+        // computes address + does the load/store + writes the destination,
+        // skipping the dispatch overhead of calc_addr_imm + load/store + store_reg.
+        if (is_unscaled && rn != 31 && rt != 31 && !sign_extend_byte_or_half) {
+            uint64_t param = rt | ((uint64_t)rn << 8) | ((uint64_t)((int64_t)(int32_t)imm9 & 0xffffffffffffULL) << 16);
+            void *g = NULL;
+            if (is_load) {
+                bool sign_extend_word = (opc == 2) && size == 2;
+                if (!sign_extend_word) {
+                    switch (size) {
+                        case 0: g = gadget_load8_imm_signed_fast;  break;
+                        case 1: g = gadget_load16_imm_signed_fast; break;
+                        case 2: g = gadget_load32_imm_signed_fast; break;
+                        case 3: g = gadget_load64_imm_signed_fast; break;
+                    }
+                }
+            } else {
+                switch (size) {
+                    case 0: g = gadget_store8_imm_signed_fast;  break;
+                    case 1: g = gadget_store16_imm_signed_fast; break;
+                    case 2: g = gadget_store32_imm_signed_fast; break;
+                    case 3: g = gadget_store64_imm_signed_fast; break;
+                }
+            }
+            if (g != NULL) {
+                gen(state, (unsigned long) g);
+                gen(state, param);
+                return 1;
+            }
+        }
+
+        // Pre/post-indexed fast path (single fused gadget): non-SP base,
+        // non-XZR data, disjoint base/data, 32 or 64-bit width, no sign-extend.
+        // Replaces the calc_addr + load/store + store_reg + writeback chain
+        // (4 gadget dispatches → 1).
+        // Pre/post-indexed fast paths.
+        // - Generic: rn != 31, rt != 31, !(load && rt==rn), size in {2,3}, no sign-extend.
+        // - STR XZR: rn != 31, rt == 31, !is_load (store XZR is "store zero" idiom).
+        // For LDR post-indexed where rt == rn, ARM CONSTRAINED UNPREDICTABLE behaviour;
+        // we fall back to the 4-gadget chain rather than risk a wrong write order.
+        if (!is_unscaled && rn != 31 && (size == 2 || size == 3)) {
+            uint64_t param = (uint64_t)(rt & 0x1f)
+                           | ((uint64_t)(rn & 0x1f) << 8)
+                           | (((uint64_t)(uint32_t)(int32_t)imm9) << 16);
+            void *g = NULL;
+            if (is_load) {
+                if (rt != 31 && rn != rt && !(opc & 2)) {
+                    if (size == 3) g = is_pre_indexed ? gadget_ldr64_imm_preidx_fast : gadget_ldr64_imm_postidx_fast;
+                    else            g = is_pre_indexed ? gadget_ldr32_imm_preidx_fast : gadget_ldr32_imm_postidx_fast;
+                }
+            } else {
+                // Store
+                if (rt != 31) {
+                    if (size == 3) g = is_pre_indexed ? gadget_str64_imm_preidx_fast : gadget_str64_imm_postidx_fast;
+                    else            g = is_pre_indexed ? gadget_str32_imm_preidx_fast : gadget_str32_imm_postidx_fast;
+                } else {
+                    // STR XZR — store zero
+                    if (size == 3) g = is_pre_indexed ? gadget_str64_xzr_imm_preidx_fast : gadget_str64_xzr_imm_postidx_fast;
+                    else            g = is_pre_indexed ? gadget_str32_xzr_imm_preidx_fast : gadget_str32_xzr_imm_postidx_fast;
+                }
+            }
+            if (g != NULL) {
+                gen(state, (unsigned long) g);
+                gen(state, param);
+                return 1;
+            }
+        }
 
         // Calculate address:
         // - mode=0 (unscaled): address = base + offset (no writeback)
@@ -3200,6 +3493,28 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
             }
         }
 
+        // Fast path: AND/ORR/EOR (no flags, no inversion, no XZR/SP).
+        // Covers the bulk of CPython interpreter bit ops + CRC inner loops.
+        if (N == 0 && opc != 3 && rn != 31 && rm != 31 && rd != 31) {
+            void *fast = NULL;
+            if (sf) {
+                switch (opc) {
+                    case 0: fast = gadget_and_reg_64_nshift; break;
+                    case 1: fast = gadget_orr_reg_64_nshift; break;
+                    case 2: fast = gadget_eor_reg_64_nshift; break;
+                }
+            } else {
+                switch (opc) {
+                    case 0: fast = gadget_and_reg_32_nshift; break;
+                    case 1: fast = gadget_orr_reg_32_nshift; break;
+                    case 2: fast = gadget_eor_reg_32_nshift; break;
+                }
+            }
+            gen(state, (unsigned long) fast);
+            gen(state, rd | ((uint64_t)rn << 8) | ((uint64_t)rm << 16));
+            return 1;
+        }
+
         void *gadget;
         switch (opc) {
             case 0: gadget = N ? gadget_and_reg : gadget_and_reg; break;  // AND/BIC
@@ -3255,6 +3570,23 @@ static int gen_dp_reg(struct gen_state *state, uint32_t insn) {
         }
         if (can_spec_reg && !S && rd != 31) {
             gen(state, (unsigned long)(op ? gadget_sub_reg_64_nshift : gadget_add_reg_64_nshift));
+            gen(state, rd | (rn << 8) | (rm << 16));
+            return 1;
+        }
+
+        // 32-bit ADD/SUB reg fast path (no shift, no flags, no XZR/SP).
+        // Hot in CRC inner loops, byte-pointer arithmetic, hash mixing.
+        if (!sf && imm6 == 0 && shift == 0 && !S && rn != 31 && rm != 31 && rd != 31) {
+            gen(state, (unsigned long)(op ? gadget_sub_reg_32_nshift : gadget_add_reg_32_nshift));
+            gen(state, rd | (rn << 8) | (rm << 16));
+            return 1;
+        }
+
+        // 32-bit ADDS/SUBS reg fast path (flag-setting, no shift, no XZR/SP).
+        // Hot in Python comparisons, CPython refcount post-decrement.
+        // rd=31 (CMP/CMN) allowed — gadget handles XZR via cmp.
+        if (!sf && imm6 == 0 && shift == 0 && S && rn != 31 && rm != 31) {
+            gen(state, (unsigned long)(op ? gadget_subs_reg_32_nshift : gadget_adds_reg_32_nshift));
             gen(state, rd | (rn << 8) | (rm << 16));
             return 1;
         }

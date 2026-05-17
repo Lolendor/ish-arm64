@@ -1,5 +1,6 @@
 #include "kernel/signal.h"
 #include "task.h"
+#include "util/signpost.h"
 #define _GNU_SOURCE
 #include <unistd.h>
 #include <fcntl.h>
@@ -216,9 +217,13 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
     // general_lock protects current->mm. otherwise procfs might read the
     // pointer before it's released and then try to lock it after it's
     // released.
+    struct mm *new_mm = mm_new();
+    if (new_mm == NULL)
+        return _ENOMEM;
     lock(&current->general_lock);
-    mm_release(current->mm);
-    task_set_mm(current, mm_new());
+    struct mm *old_mm = current->mm;
+    task_set_mm(current, new_mm);
+    mm_release(old_mm);
     unlock(&current->general_lock);
     write_wrlock(&current->mem->lock);
 
@@ -265,6 +270,10 @@ static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, stru
 
     addr_t entry = bias + header.entry_point;
     addr_t interp_base = 0;
+#ifdef GUEST_ARM64
+    current->mm->exe_bias = bias;
+    current->mm->exe_entry = entry;
+#endif
 
     if (interp_name) {
         // map dat shit! interpreter edition
@@ -654,6 +663,13 @@ static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, 
 }
 
 int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
+    ISH_SIGNPOST_SCOPE_BEGIN(exec, "execve", _exec_spid);
+    ISH_SIGNPOST_EVENT(exec, "execve_path", "path=%{public}s", file);
+    // New program starts fresh — clear V8 abort-in-progress flag so the
+    // fresh process's stderr isn't permanently muted from a prior abort.
+    if (current && current->group)
+        current->group->v8_aborting = false;
+
     struct fd *fd = generic_open(file, O_RDONLY, 0);
     if (IS_ERR(fd))
         return PTR_ERR(fd);
@@ -727,6 +743,7 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         unlock(&pids_lock);
     }
 
+    ISH_SIGNPOST_SCOPE_END(exec, "execve", _exec_spid);
     return 0;
 }
 
@@ -817,6 +834,28 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     }
     STRACE("})");
 
+    // One-line exec trace (opt-in via ISH_EXEC_TRACE env at host startup).
+    // Lets us correlate V8 crashes with the specific child command.
+    if (ish_exec_trace()) {
+        char argbuf[512];
+        size_t p = 0;
+        const char *a = argv;
+        int n = 0;
+        while (*a != '\0' && p < sizeof(argbuf) - 4 && n < 8) {
+            int wrote = snprintf(argbuf + p, sizeof(argbuf) - p,
+                                 "%s%.200s", n == 0 ? "" : " ", a);
+            if (wrote < 0 || (size_t)wrote >= sizeof(argbuf) - p) break;
+            p += wrote;
+            a += strlen(a) + 1;
+            n++;
+        }
+        argbuf[sizeof(argbuf) - 1] = 0;
+        printk("EXEC[pid=%d ppid=%d]: %.200s [%s]\n",
+               current->pid,
+               current->parent ? current->parent->pid : 0,
+               filename, argbuf);
+    }
+
 #if defined(GUEST_ARM64)
     // Force-inject environment variables into every execve'd process.
     // mode=0: inject only if not present, mode=1: replace existing value
@@ -835,6 +874,11 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
         // page table modifications. GOMAXPROCS=2 is sufficient for most Go CLI
         // tools and eliminates nearly all multi-thread race conditions.
         { "GOMAXPROCS=2", 11, 0 },             // Limit Go thread count
+        // libuv's default worker pool is 4 threads. On iSH jitless node,
+        // short scripts never use them but pay the futex sync cost. Setting
+        // to 1 saves ~1s on `node -e 0`. Apps that genuinely need more
+        // worker threads can override via the user environment (mode=0).
+        { "UV_THREADPOOL_SIZE=1", 19, 0 },
     };
     for (size_t vi = 0; vi < sizeof(inject_envs)/sizeof(inject_envs[0]); vi++) {
         char *e = envp;
@@ -881,13 +925,23 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
                 "--jitless",
                 "--no-lazy",
                 "--max-old-space-size=512",
+                // Force single-threaded V8: in jitless mode the worker pool
+                // has no JIT to do, but V8 still creates the threads and
+                // they spend ~3s/startup blocked on futex/epoll waiting for
+                // the (slow, emulated) main thread. Disabling them cuts
+                // `node -e 0` from 2.3s → 0.35s on iSH ARM64. Validated
+                // 2026-05-05 via syscall profile.
+                "--no-concurrent-marking",
+                "--no-concurrent-recompilation",
+                "--no-lazy-compile-dispatcher",
+                "--predictable",
             };
             // Conditionally inject --require for polyfill files that exist in guest fs
             static const char *optional_requires[] = {
                 "--require=/lib/wasm-polyfill.js",    // WebAssembly shim (must load first)
                 "--require=/lib/fetch-polyfill.js",   // fetch() via native http/https
             };
-            const char *inject_args[8]; // base args + optional requires
+            const char *inject_args[16]; // base args + optional requires
             size_t inject_count = 0;
             for (size_t i = 0; i < sizeof(inject_args_base)/sizeof(inject_args_base[0]); i++)
                 inject_args[inject_count++] = inject_args_base[i];
@@ -960,9 +1014,18 @@ dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     // Native offload: check if this binary should run natively on the host
     const char *native_path = native_offload_lookup(filename);
     if (native_path) {
-        // native_offload_exec calls do_exit() on success (never returns).
-        // On failure, fall through to normal emulated exec.
+        // native_offload_exec calls do_exit() on success, which unwinds via
+        // pthread_exit() and skips the err_free_{argv,envp} labels below.
+        // Register pthread cleanup handlers so the ARGV_MAX-sized buffers are
+        // freed on that unwind path; without them each native-offloaded exec
+        // (ffmpeg, minis-open, …) leaks ~2 × ARGV_MAX per process.
+        pthread_cleanup_push(free, envp);
+        pthread_cleanup_push(free, argv);
         err = native_offload_exec(native_path, filename, argc, argv, envp);
+        // Only reach here on fallback. Do not execute cleanups — the normal
+        // err_free_{argv,envp} path below will free them.
+        pthread_cleanup_pop(0);
+        pthread_cleanup_pop(0);
         if (err == 0) {
             // Should not reach here (do_exit doesn't return), but just in case
             goto err_free_envp;

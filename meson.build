@@ -31,6 +31,11 @@ endif
 
 add_project_arguments('-Wno-switch', language: 'c')
 
+# ISH_GADGET_PROFILE: enable gadget call ring-buffer + atexit dump.
+# Activate via:  meson setup ... -Dc_args=-DISH_GADGET_PROFILE
+#                or env CFLAGS=-DISH_GADGET_PROFILE meson setup ...
+# Adds ~9 instructions per gret (ring-buffer write); not for production builds.
+
 includes = [include_directories('.')]
 
 threads = dependency('threads')
@@ -200,6 +205,7 @@ if get_option('kernel') == 'ish'
         'util/sync.c',
         'util/fifo.c',
         'util/fchdir.c',
+        'util/signpost.c',
 
         'platform/' + host_machine.system() + '.c',
     ]

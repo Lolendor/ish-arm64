@@ -467,3 +467,30 @@ dword_t sys_fcntl32(fd_t fd, dword_t cmd, addr_t arg) {
     }
     return sys_fcntl(fd, cmd, arg);
 }
+
+// NOTE: openminis/master ships a simpler sys_close_range definition here;
+// we keep the fuller implementation above (handles CLOSE_RANGE_UNSHARE,
+// rejects invalid flag bits) and drop the duplicate. Behaviour is a
+// superset of what the upstream sibling provided.
+#if 0
+dword_t sys_close_range_openminis_duplicate(uint32_t first, uint32_t last, uint32_t flags) {
+    STRACE("close_range(%u, %u, 0x%x)", first, last, flags);
+    if (first > last)
+        return _EINVAL;
+    lock(&current->files->lock);
+    fd_t lim = current->files->size;
+    if ((fd_t)last >= lim) last = lim - 1;
+    int err = 0;
+    for (fd_t f = (fd_t)first; f <= (fd_t)last; f++) {
+        if (current->files->files[f] == NULL) continue;
+        if (flags & CLOSE_RANGE_CLOEXEC_) {
+            bit_set(f, current->files->cloexec);
+            continue;
+        }
+        int e = fdtable_close(current->files, f);
+        if (e != 0 && err == 0) err = e;
+    }
+    unlock(&current->files->lock);
+    return 0;
+}
+#endif

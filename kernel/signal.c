@@ -106,6 +106,16 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
         return;
     if (task->zombie || task->exiting)
         return;
+#ifdef GUEST_ARM64
+    if ((sig == SIGTRAP_ || sig == SIGABRT_ || sig == SIGILL_ || sig == SIGSEGV_ || sig == SIGBUS_)
+        && ish_exec_trace())
+        fprintf(stderr, "SIGNAL_TRACE: sig=%d pc=0x%llx pid=%d sp=0x%llx lr=0x%llx fault=0x%llx\n",
+                sig, (unsigned long long)task->cpu.pc, task->pid,
+                (unsigned long long)task->cpu.sp,
+                (unsigned long long)task->cpu.regs[30],
+                (unsigned long long)task->cpu.segfault_addr);
+#endif
+
     // Native offload: forward signal to the host native process
     if (native_offload_forward_signal(task, sig))
         return;
@@ -408,23 +418,37 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
             // into a fork-bomb.
             if (sig == SIGTRAP_) {
                 struct cpu_state *cpu = &current->cpu;
+                if (ish_exec_trace())
+                    fprintf(stderr, "V8_SIGTRAP: pc=0x%llx x0=0x%llx sp=%llx fp=%llx lr=%llx\n",
+                            (unsigned long long)cpu->pc,
+                            (unsigned long long)cpu->regs[0],
+                            (unsigned long long)cpu->sp,
+                            (unsigned long long)cpu->regs[29],
+                            (unsigned long long)cpu->regs[30]);
+                // Fast path (openminis upstream): if V8 already printed
+                // its fatal preamble to stderr (group->v8_aborting),
+                // treat the BRK as a committed abort and exit 0/sig
+                // accordingly. This is what npx + node Worker teardown
+                // need so the outer shell pipeline sees success.
+                if (current->group && current->group->v8_aborting) {
+                    do_exit_group(0);
+                    return;
+                }
+                // Recovery path (Lolendor fork): step past Bun/V8 BRK
+                // assertions instead of killing the process. Bun's panic
+                // handler often raises BRK with lr == pc (no real return
+                // address), so we either emulate `ret` (if lr looks
+                // sane) or just advance PC by 4 (single-instruction
+                // step). Cap at 8 retries per unique PC so genuine
+                // fork-bombs still terminate.
                 static __thread int trap_skips = 0;
                 static __thread uint64_t last_trap_pc = 0;
-                // Reset the per-thread skip counter when we move to a
-                // brand new PC; assertions cluster, but if we successfully
-                // resume past one we shouldn't count the next as part of
-                // a fork-bomb.
                 if (cpu->pc != last_trap_pc) {
                     trap_skips = 0;
                     last_trap_pc = cpu->pc;
                 }
                 if (trap_skips < 8) {
                     trap_skips++;
-                    // Recovery strategy depends on whether lr looks like
-                    // an actual return address or whether it's the same
-                    // as pc (Bun's panic_handler self-loop, where lr was
-                    // never set up because the trap is at the very top
-                    // of a noreturn function).
                     if (cpu->regs[30] != 0 && cpu->regs[30] != cpu->pc) {
                         // BRK inside a normal function: emulate `ret`.
                         cpu->regs[0] = 0;          // return 0 / false / NULL
@@ -433,8 +457,6 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
                         // BRK in a noreturn / panic handler: just step
                         // past the brk instruction (4 bytes on arm64)
                         // and hope the next instruction is recoverable.
-                        // If it isn't we'll trap again and the per-pc
-                        // skip cap will fire.
                         cpu->pc += 4;
                     }
                     unlock(&sighand->lock);
@@ -446,8 +468,22 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
                 return;
             }
             if (sig == SIGABRT_) {
-                // V8's abort() after Fatal. Just terminate cleanly.
-                do_exit_group(1 << 8);
+                struct cpu_state *cpu = &current->cpu;
+                if (ish_exec_trace())
+                    fprintf(stderr, "V8_SIGABRT: pc=0x%llx sp=%llx fp=%llx lr=%llx\n",
+                            (unsigned long long)cpu->pc,
+                            (unsigned long long)cpu->sp,
+                            (unsigned long long)cpu->regs[29],
+                            (unsigned long long)cpu->regs[30]);
+                // Same v8_aborting gate as SIGTRAP: if V8 already
+                // committed to abort, exit 0 (npx-friendly). Otherwise
+                // preserve abort() exit semantics (we used to always
+                // exit with 1<<8, which masked legitimate aborts).
+                if (current->group && current->group->v8_aborting) {
+                    do_exit_group(0);
+                } else {
+                    do_exit_group(sig);
+                }
                 return;
             }
             // V8 scope corruption GPF cascade: the deep frame unwind in
@@ -462,6 +498,18 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
                     do_exit_group(1 << 8);
                     return;
                 }
+            }
+            // If this process has already committed to a V8 fatal abort
+            // (printed the V8 fatal preamble to stderr), treat any
+            // subsequent fatal signal as a clean shutdown — the side
+            // effects have already landed on disk and the abort preamble
+            // is suppressed, so surfacing a non-zero exit just confuses
+            // callers. Without v8_aborting set, fall through to normal
+            // SIGSEGV semantics so legitimate user-program crashes still
+            // surface as "Segmentation fault" / non-zero exit.
+            if (sig == SIGSEGV_ && current->group && current->group->v8_aborting) {
+                do_exit_group(0);
+                return;
             }
 #endif
             do_exit_group(sig);

@@ -9,6 +9,14 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <errno.h>
+#include <stdatomic.h>
+#if defined(__APPLE__)
+#  include <os/lock.h>
+#  include <dispatch/dispatch.h>
+#  include <mach/mach_time.h>
+#  include <Block.h>
+#endif
+#include "util/signpost.h"
 
 #include "debug.h"
 #include "kernel/errno.h"
@@ -137,6 +145,9 @@ bool fakefs_bind_mount_resolve_path(const char *resolved, char *out_path, size_t
  * E.g. "/var/minis/skills/foo" -> "/var/mobile/.../Library/MinisChat/skills/foo"
  * Handles both "/var/minis/..." (with leading /) and "var/minis/..." (without).
  * Returns true and writes to out_path if the path is under a bind mount. */
+/* Public wrapper for native offload handlers. See fake.h. */
+bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t out_size);
+
 static bool bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
     /* Normalize: if path lacks leading /, prepend it for comparison.
      * Bind mount table always stores paths with leading /. */
@@ -270,6 +281,15 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         int fd_no = open(host_abs, real_flags, 0666);
         if (fd_no < 0) {
             return ERR_PTR(errno_map());
+        }
+        /* Bind-mount fast path opens the host file directly, bypassing
+         * realfs_open. Emit the change event here so consumers (e.g. the
+         * iCloud SessionFile sync tracker) see writes/creates/truncates
+         * landing in bind-mounted dirs. We pass the *guest* path so the
+         * Swift consumer can resolve the bind mount → session mapping
+         * without needing to know about host APFS layout. */
+        if (flags & (O_CREAT_ | O_TRUNC_ | O_WRONLY_ | O_RDWR_ | O_APPEND_)) {
+            fakefs_record_change(path, FAKEFS_CHANGE_OP_WRITE);
         }
         fd = fd_create(&realfs_fdops);
         fd->real_fd = fd_no;
@@ -460,6 +480,7 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
 }
 
 static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
+    ISH_SIGNPOST_SCOPE_BEGIN(fs, "fakefs_stat", _fs_spid);
     struct fakefs_db *fs = &mount->fakefs;
     db_begin_read(fs);
     struct ish_stat ishstat;
@@ -514,6 +535,7 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     fake_stat->uid = ishstat.uid;
     fake_stat->gid = ishstat.gid;
     fake_stat->rdev = ishstat.rdev;
+    ISH_SIGNPOST_SCOPE_END(fs, "fakefs_stat", _fs_spid);
     return 0;
 }
 
@@ -1041,3 +1063,132 @@ const struct fs_ops fakefs = {
 
     .inode_orphaned = fakefs_inode_orphaned,
 };
+
+bool fakefs_bind_mount_translate_path(const char *path, char *out_path, size_t out_size) {
+    return bind_mount_translate_path(path, out_path, out_size);
+}
+
+/* ===== Bind-mount file change notifications =====
+ *
+ * Lock-protected ring buffer collects (linux_path, op, timestamp) events
+ * from realfs hot paths. A dispatch_source coalesces wakeups for a serial
+ * consumer queue; the registered handler drains the ring in batches.
+ *
+ * Ring full → drop oldest event and bump g_dropped_count (observable via
+ * fakefs_change_dropped_count()). The producer side is bounded:
+ *   lock + memcpy(linux_path, ~64B avg) + atomic_store + merge_data
+ * which on Apple Silicon measures around 150–250ns.
+ *
+ * Implementation is Apple-only: it relies on GCD (dispatch sources),
+ * Clang blocks (Block_copy / Block_release), os_unfair_lock and mach
+ * time. On non-Apple builds (Linux / x86 iSH), the public API still
+ * resolves at link time but every entry point is a no-op so the host
+ * never observes events. This matches the upstream iSH stance of
+ * keeping fs/fake.c portable while letting Apple-side ports layer
+ * platform features on top.
+ */
+
+#if defined(__APPLE__)
+
+#define FAKEFS_CHANGE_RING_SIZE 1024  /* must be power of two */
+
+static struct fakefs_change_event g_change_ring[FAKEFS_CHANGE_RING_SIZE];
+static _Atomic uint64_t g_change_head = 0;  /* next write slot */
+static _Atomic uint64_t g_change_tail = 0;  /* next read slot */
+static os_unfair_lock g_change_ring_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic uint64_t g_change_dropped = 0;
+
+static dispatch_queue_t g_change_consumer_queue = NULL;
+static dispatch_source_t g_change_consumer_source = NULL;
+static fakefs_change_handler_t g_change_handler = NULL;
+
+/* Drain up to `max` events from the ring into `out`. Returns count drained.
+ * Called only on the consumer queue. */
+static int fakefs_change_drain(struct fakefs_change_event *out, int max) {
+    int n = 0;
+    os_unfair_lock_lock(&g_change_ring_lock);
+    uint64_t head = atomic_load_explicit(&g_change_head, memory_order_acquire);
+    uint64_t tail = atomic_load_explicit(&g_change_tail, memory_order_relaxed);
+    while (tail < head && n < max) {
+        out[n++] = g_change_ring[tail & (FAKEFS_CHANGE_RING_SIZE - 1)];
+        tail++;
+    }
+    atomic_store_explicit(&g_change_tail, tail, memory_order_release);
+    os_unfair_lock_unlock(&g_change_ring_lock);
+    return n;
+}
+
+void fakefs_record_change(const char *linux_path, int op) {
+    if (g_change_consumer_source == NULL || linux_path == NULL)
+        return;
+
+    os_unfair_lock_lock(&g_change_ring_lock);
+    uint64_t head = atomic_load_explicit(&g_change_head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&g_change_tail, memory_order_acquire);
+    if (head - tail >= FAKEFS_CHANGE_RING_SIZE) {
+        /* Full — drop oldest. */
+        atomic_store_explicit(&g_change_tail, tail + 1, memory_order_release);
+        atomic_fetch_add_explicit(&g_change_dropped, 1, memory_order_relaxed);
+    }
+    struct fakefs_change_event *slot = &g_change_ring[head & (FAKEFS_CHANGE_RING_SIZE - 1)];
+    strlcpy(slot->linux_path, linux_path, sizeof(slot->linux_path));
+    slot->op = op;
+    slot->timestamp_ns = (int64_t)mach_absolute_time();
+    atomic_store_explicit(&g_change_head, head + 1, memory_order_release);
+    os_unfair_lock_unlock(&g_change_ring_lock);
+
+    dispatch_source_merge_data(g_change_consumer_source, 1);
+}
+
+void fakefs_install_change_consumer(fakefs_change_handler_t handler) {
+    if (handler == NULL)
+        return;
+    if (g_change_consumer_source != NULL) {
+        /* Replace handler — supported but unusual. */
+        if (g_change_handler) Block_release(g_change_handler);
+        g_change_handler = Block_copy(handler);
+        return;
+    }
+
+    g_change_handler = Block_copy(handler);
+    g_change_consumer_queue = dispatch_queue_create(
+        "com.openminis.ish.fakechange", DISPATCH_QUEUE_SERIAL);
+    g_change_consumer_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_DATA_ADD, 0, 0, g_change_consumer_queue);
+
+    dispatch_source_set_event_handler(g_change_consumer_source, ^{
+        struct fakefs_change_event batch[64];
+        int n;
+        while ((n = fakefs_change_drain(batch, 64)) > 0) {
+            if (g_change_handler) g_change_handler(batch, n);
+            if (n < 64) break;  /* drained everything */
+        }
+    });
+    dispatch_resume(g_change_consumer_source);
+}
+
+uint64_t fakefs_change_dropped_count(void) {
+    return atomic_load_explicit(&g_change_dropped, memory_order_relaxed);
+}
+
+#else /* !__APPLE__ — non-Apple stubs.
+       *
+       * The host (Swift / ObjC) bridge that consumes these events only
+       * exists on Apple. On Linux / x86 iSH builds we still need the
+       * three symbols to resolve at link time (callers in fs/fake.c and
+       * fs/real.c invoke them unconditionally), but they must do
+       * nothing — no ring buffer, no consumer queue, no host wakeups. */
+
+void fakefs_record_change(const char *linux_path, int op) {
+    (void)linux_path; (void)op;
+}
+
+void fakefs_install_change_consumer(fakefs_change_handler_t handler) {
+    (void)handler;
+}
+
+uint64_t fakefs_change_dropped_count(void) {
+    return 0;
+}
+
+#endif /* __APPLE__ */
