@@ -37,7 +37,11 @@ static struct rlimit_ init_rlimits[16] = {
     [RLIMIT_CPU_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_FSIZE_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_DATA_]       = {RLIM_INFINITY_, RLIM_INFINITY_},
+#ifdef GUEST_ARM64
+    [RLIMIT_STACK_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
+#else
     [RLIMIT_STACK_]      = {128*1024*1024, RLIM_INFINITY_},
+#endif
     [RLIMIT_CORE_]       = {0, RLIM_INFINITY_},
     [RLIMIT_RSS_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_NPROC_]      = {1024, 1024},

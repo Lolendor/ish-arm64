@@ -2540,4 +2540,3 @@ ldxp_c_segfault:
     strb wzr, [_cpu, #CPU_segfault_was_write]
     mov w0, #INT_GPF
     b fiber_exit
-

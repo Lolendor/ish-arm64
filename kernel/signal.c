@@ -9,6 +9,10 @@
 #include "kernel/vdso.h"
 #include "emu/interrupt.h"
 
+#ifndef ISH_DEBUG_SKIP_BRK
+#define ISH_DEBUG_SKIP_BRK 0
+#endif
+
 #if is_gcc(9)
 #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
 #endif
@@ -102,12 +106,6 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
         return;
     if (task->zombie || task->exiting)
         return;
-#ifdef GUEST_ARM64
-    if (sig == SIGTRAP_ || sig == SIGABRT_ || sig == SIGILL_ || sig == SIGSEGV_ || sig == SIGBUS_)
-        fprintf(stderr, "SIGNAL_TRACE: sig=%d pc=0x%llx pid=%d\n",
-                sig, (unsigned long long)task->cpu.pc, task->pid);
-#endif
-
     // Native offload: forward signal to the host native process
     if (native_offload_forward_signal(task, sig))
         return;
@@ -378,7 +376,7 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
 
         case SIGNAL_KILL:
             unlock(&sighand->lock); // do_exit must be called without this lock
-#ifdef GUEST_ARM64
+#if defined(GUEST_ARM64) && ISH_DEBUG_SKIP_BRK
             // V8 / JSC / Bun emit `BRK #N` (delivers SIGTRAP to the
             // process) for IMMEDIATE_CRASH(), DCHECK_*, and assorted
             // assertion macros at compile time. For Bun specifically,
@@ -420,14 +418,6 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
                     trap_skips = 0;
                     last_trap_pc = cpu->pc;
                 }
-                fprintf(stderr,
-                        "V8_SIGTRAP: pc=0x%llx x0=0x%llx sp=%llx fp=%llx lr=%llx skip=%d\n",
-                        (unsigned long long)cpu->pc,
-                        (unsigned long long)cpu->regs[0],
-                        (unsigned long long)cpu->sp,
-                        (unsigned long long)cpu->regs[29],
-                        (unsigned long long)cpu->regs[30],
-                        trap_skips);
                 if (trap_skips < 8) {
                     trap_skips++;
                     // Recovery strategy depends on whether lr looks like
@@ -452,20 +442,11 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
                 }
                 trap_skips = 0;
                 last_trap_pc = 0;
-                fprintf(stderr,
-                        "V8_SIGTRAP: too many skips at pc=0x%llx, terminating\n",
-                        (unsigned long long)cpu->pc);
                 do_exit_group(1 << 8);
                 return;
             }
             if (sig == SIGABRT_) {
                 // V8's abort() after Fatal. Just terminate cleanly.
-                struct cpu_state *cpu = &current->cpu;
-                fprintf(stderr, "V8_SIGABRT: pc=0x%llx sp=%llx fp=%llx lr=%llx\n",
-                        (unsigned long long)cpu->pc,
-                        (unsigned long long)cpu->sp,
-                        (unsigned long long)cpu->regs[29],
-                        (unsigned long long)cpu->regs[30]);
                 do_exit_group(1 << 8);
                 return;
             }

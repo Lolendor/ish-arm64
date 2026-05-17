@@ -344,8 +344,21 @@ static ssize_t iovec_size(struct iovec_ *iovec, unsigned iovec_count) {
     return size;
 }
 
+#define UIO_MAXIOV_ 1024
+
+static int check_iovec_count(qword_t iovec_count) {
+    if (iovec_count > UIO_MAXIOV_)
+        return _EINVAL;
+    return 0;
+}
+
 dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     STRACE("readv(%d, %#x, %d)", fd_no, iovec_addr, iovec_count);
+    int err = check_iovec_count(iovec_count);
+    if (err < 0)
+        return err;
+    if (iovec_count == 0)
+        return 0;
     struct iovec_ *iovec = read_iovec(iovec_addr, iovec_count);
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
@@ -380,6 +393,11 @@ error:
 
 dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
     STRACE("writev(%d, %#x, %d)", fd_no, iovec_addr, iovec_count);
+    int err = check_iovec_count(iovec_count);
+    if (err < 0)
+        return err;
+    if (iovec_count == 0)
+        return 0;
     struct iovec_ *iovec = read_iovec(iovec_addr, iovec_count);
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
@@ -409,6 +427,121 @@ error:
     free(buf);
     free(iovec);
     return res;
+}
+
+static dword_t process_vm_copy_one(struct task *remote_task, addr_t src, addr_t dst, size_t len, bool write_remote) {
+    char buf[PAGE_SIZE];
+    size_t done = 0;
+    while (done < len) {
+        size_t chunk = len - done;
+        if (chunk > sizeof(buf))
+            chunk = sizeof(buf);
+        int read_err = write_remote
+            ? user_read(src + done, buf, chunk)
+            : user_read_task(remote_task, src + done, buf, chunk);
+        if (read_err)
+            break;
+        int write_err = write_remote
+            ? user_write_task(remote_task, dst + done, buf, chunk)
+            : user_write(dst + done, buf, chunk);
+        if (write_err)
+            break;
+        done += chunk;
+    }
+    return done;
+}
+
+static dword_t process_vm_copy(pid_t_ pid, addr_t local_iov_addr, qword_t local_iov_count,
+        addr_t remote_iov_addr, qword_t remote_iov_count, qword_t flags, bool write_remote) {
+    if (flags != 0)
+        return _EINVAL;
+    int err = check_iovec_count(local_iov_count);
+    if (err < 0)
+        return err;
+    err = check_iovec_count(remote_iov_count);
+    if (err < 0)
+        return err;
+    if (pid != current->pid) {
+        lock(&pids_lock);
+        struct task *target = pid_get_task(pid);
+        unlock(&pids_lock);
+        return target == NULL ? _ESRCH : _EPERM;
+    }
+    if (local_iov_count == 0 || remote_iov_count == 0)
+        return 0;
+
+    struct iovec_ *local_iov = read_iovec(local_iov_addr, local_iov_count);
+    if (IS_ERR(local_iov))
+        return PTR_ERR(local_iov);
+    struct iovec_ *remote_iov = read_iovec(remote_iov_addr, remote_iov_count);
+    if (IS_ERR(remote_iov)) {
+        err = PTR_ERR(remote_iov);
+        free(local_iov);
+        return err;
+    }
+    size_t local_size = iovec_size(local_iov, local_iov_count);
+    size_t remote_size = iovec_size(remote_iov, remote_iov_count);
+    if (local_size == 0 || remote_size == 0) {
+        free(remote_iov);
+        free(local_iov);
+        return 0;
+    }
+
+    dword_t copied = 0;
+    qword_t local_index = 0;
+    qword_t remote_index = 0;
+    size_t local_offset = 0;
+    size_t remote_offset = 0;
+    while (local_index < local_iov_count && remote_index < remote_iov_count) {
+        size_t local_left = local_iov[local_index].len - local_offset;
+        size_t remote_left = remote_iov[remote_index].len - remote_offset;
+        size_t chunk = local_left < remote_left ? local_left : remote_left;
+        if (chunk == 0) {
+            if (local_left == 0) {
+                local_index++;
+                local_offset = 0;
+            }
+            if (remote_left == 0) {
+                remote_index++;
+                remote_offset = 0;
+            }
+            continue;
+        }
+        addr_t local_addr = local_iov[local_index].base + local_offset;
+        addr_t remote_addr = remote_iov[remote_index].base + remote_offset;
+        dword_t res = write_remote
+            ? process_vm_copy_one(current, local_addr, remote_addr, chunk, true)
+            : process_vm_copy_one(current, remote_addr, local_addr, chunk, false);
+        copied += res;
+        if (res != chunk)
+            break;
+        local_offset += chunk;
+        remote_offset += chunk;
+    }
+
+    free(remote_iov);
+    free(local_iov);
+    if (copied == 0)
+        return _EFAULT;
+    return copied;
+}
+
+dword_t sys_process_vm_readv(pid_t_ pid, addr_t local_iov_addr, qword_t local_iov_count,
+        addr_t remote_iov_addr, qword_t remote_iov_count, qword_t flags) {
+    STRACE("process_vm_readv(%d, %#x, %llu, %#x, %llu, %llu)", pid, local_iov_addr,
+            (unsigned long long) local_iov_count, remote_iov_addr,
+            (unsigned long long) remote_iov_count, (unsigned long long) flags);
+    return process_vm_copy(pid, local_iov_addr, local_iov_count, remote_iov_addr,
+            remote_iov_count, flags, false);
+}
+
+dword_t sys_process_vm_writev(pid_t_ pid, addr_t local_iov_addr, qword_t local_iov_count,
+        addr_t remote_iov_addr, qword_t remote_iov_count, qword_t flags) {
+    STRACE("process_vm_writev(%d, %#x, %llu, %#x, %llu, %llu)", pid, local_iov_addr,
+            (unsigned long long) local_iov_count, remote_iov_addr,
+            (unsigned long long) remote_iov_count, (unsigned long long) flags);
+    return process_vm_copy(pid, local_iov_addr, local_iov_count, remote_iov_addr,
+            remote_iov_count, flags, true);
 }
 
 dword_t sys__llseek(fd_t f, dword_t off_high, dword_t off_low, addr_t res_addr, dword_t whence) {

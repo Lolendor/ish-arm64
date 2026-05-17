@@ -23,6 +23,9 @@ int must_check user_write_task(struct task *task, addr_t addr, const void *buf, 
 int must_check user_write_task_ptrace(struct task *task, addr_t addr, const void *buf, size_t count);
 int must_check user_read_string(addr_t addr, char *buf, size_t max);
 int must_check user_write_string(addr_t addr, const char *buf);
+#ifdef GUEST_ARM64
+int mem_grow_down_to(struct mem *mem, addr_t addr, int flags);
+#endif
 #define user_get(addr, var) user_read(addr, &(var), sizeof(var))
 #define user_put(addr, var) user_write(addr, &(var), sizeof(var))
 #define user_get_task(task, addr, var) user_read_task(task, addr, &(var), sizeof(var))
@@ -94,6 +97,8 @@ dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size);
 dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count);
 dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size);
 dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count);
+dword_t sys_process_vm_readv(pid_t_ pid, addr_t local_iov_addr, qword_t local_iov_count, addr_t remote_iov_addr, qword_t remote_iov_count, qword_t flags);
+dword_t sys_process_vm_writev(pid_t_ pid, addr_t local_iov_addr, qword_t local_iov_count, addr_t remote_iov_addr, qword_t remote_iov_count, qword_t flags);
 dword_t sys__llseek(fd_t f, dword_t off_high, dword_t off_low, addr_t res_addr, dword_t whence);
 dword_t sys_lseek(fd_t f, dword_t off, dword_t whence);
 qword_t sys_lseek64(fd_t f, sqword_t off, dword_t whence);

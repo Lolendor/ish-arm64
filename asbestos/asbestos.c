@@ -4,7 +4,9 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <time.h>
+#include <unistd.h>
 #include "asbestos/asbestos.h"
 #include "asbestos/gen.h"
 #include "asbestos/frame.h"
@@ -25,9 +27,82 @@
 // to cpu_state via the _cpu pointer (x1) from ucontext.
 __thread volatile sig_atomic_t in_jit;
 __thread volatile addr_t jit_saved_pc;  // block start PC, read by signal handler
+static __thread struct fiber_frame *jit_current_frame;
 // Marker set to 1 on iSH execution threads so the signal handler can distinguish
 // iSH threads from app threads (Swift async, networking, UI).
 __thread int ish_thread_marker;
+
+#if defined(GUEST_ARM64) && defined(__aarch64__)
+extern void jit_crash_trampoline(void);
+
+static pthread_once_t jit_crash_handler_once = PTHREAD_ONCE_INIT;
+static struct sigaction previous_sigsegv;
+static struct sigaction previous_sigbus;
+
+static void forward_signal_to_previous(int sig, siginfo_t *info, void *ctx) {
+    struct sigaction *previous = sig == SIGBUS ? &previous_sigbus : &previous_sigsegv;
+    if (previous->sa_flags & SA_SIGINFO) {
+        if (previous->sa_sigaction != NULL) {
+            previous->sa_sigaction(sig, info, ctx);
+            return;
+        }
+    } else if (previous->sa_handler == SIG_IGN) {
+        return;
+    } else if (previous->sa_handler != NULL && previous->sa_handler != SIG_DFL) {
+        previous->sa_handler(sig);
+        return;
+    }
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void jit_crash_handler(int sig, siginfo_t *info, void *ctx) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && in_jit) {
+        ucontext_t *uc = (ucontext_t *)ctx;
+        uint64_t cpu_ptr = (uint64_t)&jit_current_frame->cpu;
+        uint64_t x7 = uc->uc_mcontext->__ss.__x[7];
+        uint64_t x10 = uc->uc_mcontext->__ss.__x[10];
+        uint64_t saved_fault = *(uint64_t *)(cpu_ptr + offsetof(struct cpu_state, segfault_addr));
+        uint64_t guest_addr = saved_fault != 0 ? saved_fault : ((x7 - x10) & 0xffffffffffffULL);
+
+        extern __thread volatile uint64_t jit_last_host_fault;
+        extern __thread volatile uint64_t jit_last_x7;
+        extern __thread volatile uint64_t jit_last_x10;
+        extern __thread volatile int jit_crash_count;
+        jit_last_host_fault = (uint64_t) info->si_addr;
+        jit_last_x7 = x7;
+        jit_last_x10 = x10;
+        jit_crash_count++;
+
+        uint64_t esr = uc->uc_mcontext->__es.__esr;
+        int was_write = (esr & 0x40) != 0;
+        *(uint64_t *)(cpu_ptr + offsetof(struct cpu_state, segfault_addr)) = guest_addr;
+        *(int *)(cpu_ptr + offsetof(struct cpu_state, segfault_was_write)) = was_write;
+        *(uint64_t *)(cpu_ptr + offsetof(struct cpu_state, pc)) = (uint64_t) jit_saved_pc;
+
+        uint64_t exit_sp = jit_current_frame->jit_exit_sp;
+        uc->uc_mcontext->__ss.__sp = exit_sp;
+        uc->uc_mcontext->__ss.__pc = (uint64_t) jit_crash_trampoline;
+
+        sigset_t unblock;
+        sigemptyset(&unblock);
+        sigaddset(&unblock, sig);
+        sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+        return;
+    }
+    forward_signal_to_previous(sig, info, ctx);
+}
+
+static void install_jit_crash_handler_once(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = jit_crash_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, &previous_sigsegv);
+    sigaction(SIGBUS, &sa, &previous_sigbus);
+}
+#endif
 
 // Architecture-specific instruction pointer access
 #if defined(GUEST_ARM64)
@@ -57,6 +132,9 @@ static void fiber_free_jetsam(struct asbestos *asbestos);
 static void fiber_resize_hash(struct asbestos *asbestos, size_t new_size);
 
 struct asbestos *asbestos_new(struct mmu *mmu) {
+#if defined(GUEST_ARM64) && defined(__aarch64__)
+    pthread_once(&jit_crash_handler_once, install_jit_crash_handler_once);
+#endif
     struct asbestos *asbestos = calloc(1, sizeof(struct asbestos));
     asbestos->mmu = mmu;
     fiber_resize_hash(asbestos, FIBER_INITIAL_HASH_SIZE);
@@ -346,10 +424,12 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         // Save block start PC to thread-local for crash recovery.
         // The signal handler reads this to restore cpu->pc on SIGSEGV.
         jit_saved_pc = frame->cpu.pc;
+        jit_current_frame = frame;
 
         in_jit = 1;
         interrupt = fiber_enter(block, frame, tlb);
         in_jit = 0;
+        jit_current_frame = NULL;
 
         // Check if fiber_enter returned due to a JIT crash (signal handler
         // redirected PC to jit_crash_trampoline which returns INT_JIT_CRASH).

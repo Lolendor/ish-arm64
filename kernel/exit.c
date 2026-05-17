@@ -258,9 +258,6 @@ noreturn void do_exit_group(int status) {
 
         if (waited_ms >= max_wait_ms) {
             // Threads are stuck in blocking syscalls and won't exit.
-            printk("SAFETY-VALVE[exit]: pid=%d do_exit_group waited %dms, %d threads still stuck → force kill\n",
-                   current->pid, waited_ms, last_remaining);
-
             // Try SIGUSR1 first (interrupts blocking syscalls without
             // corrupting heap state). If after 3 rounds the thread is
             // still alive — most likely because the host application
@@ -345,9 +342,7 @@ noreturn void do_exit_group(int status) {
             }
             unlock(&group->lock);
             unlock(&pids_lock);
-            if (leaked > 0)
-                printk("SAFETY-VALVE[exit]: pid=%d leaked %d stuck host threads\n",
-                       current->pid, leaked);
+            (void)leaked;
         } else {
 
             // Give extra time for pthread cleanup on host system

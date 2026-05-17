@@ -13,6 +13,77 @@ static void proc_pid_getname(struct proc_entry *entry, char *buf) {
     sprintf(buf, "%d", entry->pid);
 }
 
+struct proc_pid_mem_stats {
+    pages_t size;
+    pages_t resident;
+    pages_t shared;
+    pages_t text;
+    pages_t data;
+    pages_t stack;
+};
+
+static void proc_pid_mem_stats_get(struct task *task, struct proc_pid_mem_stats *stats) {
+    memset(stats, 0, sizeof(*stats));
+    struct mem *mem = task->mem;
+    if (mem == NULL)
+        return;
+
+    read_wrlock(&mem->lock);
+#ifdef GUEST_ARM64
+    for (struct mem_reservation *res = mem->reservations; res; res = res->next) {
+        stats->size += res->pages;
+        if (res->flags & P_EXEC)
+            stats->text += res->pages;
+        if ((res->flags & (P_WRITE | P_ANONYMOUS | P_GROWSDOWN)) != 0)
+            stats->data += res->pages;
+    }
+#endif
+    page_t page = 0;
+    while (page < MEM_PAGES) {
+        while (page < MEM_PAGES && mem_pt(mem, page) == NULL)
+            mem_next_page(mem, &page);
+        if (page >= MEM_PAGES)
+            break;
+        page_t start = page;
+        struct pt_entry *start_pt = mem_pt(mem, start);
+        struct data *data = start_pt->data;
+
+        while (page < MEM_PAGES) {
+            struct pt_entry *pt = mem_pt(mem, page);
+            if (pt == NULL)
+                break;
+            if ((pt->flags & P_RWX) != (start_pt->flags & P_RWX))
+                break;
+            if (!(pt->data == data || (pt->flags & P_ANONYMOUS && start_pt->flags & P_ANONYMOUS)))
+                break;
+            page++;
+        }
+        pages_t pages = page - start;
+        stats->size += pages;
+        stats->resident += pages;
+        if (start_pt->flags & P_SHARED)
+            stats->shared += pages;
+        if (start_pt->flags & P_EXEC)
+            stats->text += pages;
+        if (start_pt->flags & P_GROWSDOWN)
+            stats->stack += pages;
+        if ((start_pt->flags & (P_WRITE | P_ANONYMOUS | P_GROWSDOWN)) != 0)
+            stats->data += pages;
+    }
+    read_wrunlock(&mem->lock);
+}
+
+static void proc_pid_signal_masks(struct task *task, sigset_t_ *ignored, sigset_t_ *caught) {
+    *ignored = 0;
+    *caught = 0;
+    for (int i = 0; i < 32; i++) {
+        if (task->sighand->action[i].handler == SIG_IGN_)
+            *ignored |= 1ull << i;
+        else if (task->sighand->action[i].handler != SIG_DFL_)
+            *caught |= 1ull << i;
+    }
+}
+
 static struct task *proc_get_task(struct proc_entry *entry) {
     lock(&pids_lock);
     struct task *task = pid_get_task(entry->pid);
@@ -68,8 +139,10 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%ld ", 0l); // itimer value (deprecated, always 0)
     proc_printf(buf, "%lld ", 0ll); // jiffies on process start
 
-    proc_printf(buf, "%lu ", 0l); // vsize
-    proc_printf(buf, "%ld ", 0l); // rss
+    struct proc_pid_mem_stats mem_stats;
+    proc_pid_mem_stats_get(task, &mem_stats);
+    proc_printf(buf, "%llu ", (unsigned long long) mem_stats.size * PAGE_SIZE); // vsize
+    proc_printf(buf, "%lld ", (long long) mem_stats.resident); // rss
     proc_printf(buf, "%lu ", 0l); // rss limit
 
     // bunch of shit that can only be accessed by a debugger
@@ -81,14 +154,8 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
 
     proc_printf(buf, "%lu ", (unsigned long) task->pending & 0xffffffff);
     proc_printf(buf, "%lu ", (unsigned long) task->blocked & 0xffffffff);
-    uint32_t ignored = 0;
-    uint32_t caught = 0;
-    for (int i = 0; i < 32; i++) {
-        if (task->sighand->action[i].handler == SIG_IGN_)
-            ignored |= 1l << i;
-        else if (task->sighand->action[i].handler != SIG_DFL_)
-            caught |= 1l << i;
-    }
+    sigset_t_ ignored, caught;
+    proc_pid_signal_masks(task, &ignored, &caught);
     proc_printf(buf, "%lu ", (unsigned long) ignored);
     proc_printf(buf, "%lu ", (unsigned long) caught);
 
@@ -112,15 +179,81 @@ static int proc_pid_statm_show(struct proc_entry *entry, struct proc_data *buf) 
     if (task == NULL)
         return _ESRCH;
 
-    proc_printf(buf, "%lu ", 0); // total vm size
-    proc_printf(buf, "%lu ", 0); // vm resident size
-    proc_printf(buf, "%lu ", 0); // resident shared
-    proc_printf(buf, "%lu ", 0); // text
-    proc_printf(buf, "%lu ", 0); // lib (always 0 since linux 2.6)
-    proc_printf(buf, "%lu ", 0); // data + stack
-    proc_printf(buf, "%lu ", 0); // dirty (always 0 since linux 2.6)
+    struct proc_pid_mem_stats mem_stats;
+    proc_pid_mem_stats_get(task, &mem_stats);
+    proc_printf(buf, "%llu ", (unsigned long long) mem_stats.size); // total vm size
+    proc_printf(buf, "%llu ", (unsigned long long) mem_stats.resident); // vm resident size
+    proc_printf(buf, "%llu ", (unsigned long long) mem_stats.shared); // resident shared
+    proc_printf(buf, "%llu ", (unsigned long long) mem_stats.text); // text
+    proc_printf(buf, "%lu ", 0ul); // lib (always 0 since linux 2.6)
+    proc_printf(buf, "%llu ", (unsigned long long) mem_stats.data); // data + stack
+    proc_printf(buf, "%lu ", 0ul); // dirty (always 0 since linux 2.6)
     proc_printf(buf, "\n");
 
+    proc_put_task(task);
+    return 0;
+}
+
+static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct task *task = proc_get_task(entry);
+    if (task == NULL)
+        return _ESRCH;
+
+    lock(&task->general_lock);
+    lock(&task->group->lock);
+    lock(&task->sighand->lock);
+
+    struct proc_pid_mem_stats mem_stats;
+    proc_pid_mem_stats_get(task, &mem_stats);
+    sigset_t_ ignored, caught;
+    proc_pid_signal_masks(task, &ignored, &caught);
+    char state = task->zombie ? 'Z' : task->group->stopped ? 'T' : 'R';
+    const char *state_name = task->zombie ? "zombie" : task->group->stopped ? "stopped" : "running";
+
+    proc_printf(buf, "Name:\t%.16s\n", task->comm);
+    proc_printf(buf, "Umask:\t%04o\n", task->fs ? task->fs->umask : 0);
+    proc_printf(buf, "State:\t%c (%s)\n", state, state_name);
+    proc_printf(buf, "Tgid:\t%d\n", task->tgid);
+    proc_printf(buf, "Ngid:\t0\n");
+    proc_printf(buf, "Pid:\t%d\n", task->pid);
+    proc_printf(buf, "PPid:\t%d\n", task->parent ? task->parent->pid : 0);
+    proc_printf(buf, "TracerPid:\t0\n");
+    proc_printf(buf, "Uid:\t%d\t%d\t%d\t%d\n", task->uid, task->euid, task->suid, task->euid);
+    proc_printf(buf, "Gid:\t%d\t%d\t%d\t%d\n", task->gid, task->egid, task->sgid, task->egid);
+    proc_printf(buf, "FDSize:\t%d\n", task->files ? task->files->size : 0);
+    proc_printf(buf, "Groups:");
+    for (unsigned i = 0; i < task->ngroups; i++)
+        proc_printf(buf, "\t%d", task->groups[i]);
+    proc_printf(buf, "\n");
+    proc_printf(buf, "VmPeak:\t%8llu kB\n", (unsigned long long) mem_stats.size * (PAGE_SIZE / 1024));
+    proc_printf(buf, "VmSize:\t%8llu kB\n", (unsigned long long) mem_stats.size * (PAGE_SIZE / 1024));
+    proc_printf(buf, "VmRSS:\t%8llu kB\n", (unsigned long long) mem_stats.resident * (PAGE_SIZE / 1024));
+    proc_printf(buf, "VmData:\t%8llu kB\n", (unsigned long long) mem_stats.data * (PAGE_SIZE / 1024));
+    proc_printf(buf, "VmStk:\t%8llu kB\n", (unsigned long long) mem_stats.stack * (PAGE_SIZE / 1024));
+    proc_printf(buf, "VmExe:\t%8llu kB\n", (unsigned long long) mem_stats.text * (PAGE_SIZE / 1024));
+    proc_printf(buf, "VmLib:\t%8d kB\n", 0);
+    proc_printf(buf, "Threads:\t%ld\n", list_size(&task->group->threads));
+    proc_printf(buf, "SigQ:\t0/0\n");
+    proc_printf(buf, "SigPnd:\t%016llx\n", (unsigned long long) task->pending);
+    proc_printf(buf, "ShdPnd:\t%016llx\n", 0ull);
+    proc_printf(buf, "SigBlk:\t%016llx\n", (unsigned long long) task->blocked);
+    proc_printf(buf, "SigIgn:\t%016llx\n", (unsigned long long) ignored);
+    proc_printf(buf, "SigCgt:\t%016llx\n", (unsigned long long) caught);
+    proc_printf(buf, "CapInh:\t%016llx\n", 0ull);
+    proc_printf(buf, "CapPrm:\t%016llx\n", 0ull);
+    proc_printf(buf, "CapEff:\t%016llx\n", 0ull);
+    proc_printf(buf, "CapBnd:\t%016llx\n", 0ull);
+    proc_printf(buf, "CapAmb:\t%016llx\n", 0ull);
+    proc_printf(buf, "NoNewPrivs:\t0\n");
+    proc_printf(buf, "Seccomp:\t0\n");
+    proc_printf(buf, "Cpus_allowed:\t1\n");
+    proc_printf(buf, "Cpus_allowed_list:\t0\n");
+    proc_printf(buf, "Mems_allowed:\t1\n");
+    proc_printf(buf, "Mems_allowed_list:\t0\n");
+
+    unlock(&task->sighand->lock);
+    unlock(&task->group->lock);
+    unlock(&task->general_lock);
     proc_put_task(task);
     return 0;
 }
@@ -376,6 +509,7 @@ struct proc_children proc_pid_children = PROC_CHILDREN({
     {"mem", .pread = proc_pid_mem_pread, .pwrite = proc_pid_mem_pwrite},
     {"stat", .show = proc_pid_stat_show},
     {"statm", .show = proc_pid_statm_show},
+    {"status", .show = proc_pid_status_show},
     {"task", S_IFDIR, .readdir = proc_pid_task_readdir},
 });
 

@@ -279,11 +279,18 @@ void fdtable_do_cloexec(struct fdtable *table) {
 #define F_GETLK_ 5
 #define F_SETLK_ 6
 #define F_SETLKW_ 7
+#define F_GETOWN_ 9
+#define F_SETOWN_ 8
 #define F_GETLK64_ 12
 #define F_SETLK64_ 13
 #define F_SETLKW64_ 14
 
 #define F_DUPFD_CLOEXEC_ 1030
+#define F_SETPIPE_SZ_ 1031
+#define F_GETPIPE_SZ_ 1032
+#define F_OFD_GETLK_ 36
+#define F_OFD_SETLK_ 37
+#define F_OFD_SETLKW_ 38
 
 dword_t sys_dup(fd_t f) {
     STRACE("dup(%d)", f);
@@ -369,6 +376,20 @@ dword_t sys_fcntl(fd_t f, dword_t cmd, addr_t arg) {
             STRACE("fcntl(%d, F_SETFL, %#x)", f, arg);
             return fd_setflags(fd, arg);
 
+        case F_SETOWN_:
+            STRACE("fcntl(%d, F_SETOWN, %d)", f, arg);
+            return 0;
+        case F_GETOWN_:
+            STRACE("fcntl(%d, F_GETOWN)", f);
+            return 0;
+
+        case F_SETPIPE_SZ_:
+            STRACE("fcntl(%d, F_SETPIPE_SZ, %d)", f, arg);
+            return arg;
+        case F_GETPIPE_SZ_:
+            STRACE("fcntl(%d, F_GETPIPE_SZ)", f);
+            return 65536;
+
         case F_GETLK_:
             STRACE("fcntl(%d, F_GETLK, %#x)", f, arg);
             if (user_read(arg, &flock32, sizeof(flock32)))
@@ -414,10 +435,22 @@ dword_t sys_fcntl(fd_t f, dword_t cmd, addr_t arg) {
 
         case F_SETLK64_:
         case F_SETLKW64_:
+        case F_OFD_SETLK_:
+        case F_OFD_SETLKW_:
             STRACE("fcntl(%d, F_SETLK%*s64, %#x)", f, cmd == F_SETLKW_, "W", arg);
             if (user_read(arg, &flock, sizeof(flock)))
                 return _EFAULT;
             return fcntl_setlk(fd, &flock, cmd == F_SETLKW_);
+
+        case F_OFD_GETLK_:
+            STRACE("fcntl(%d, F_OFD_GETLK, %#x)", f, arg);
+            if (user_read(arg, &flock, sizeof(flock)))
+                return _EFAULT;
+            err = fcntl_getlk(fd, &flock);
+            if (err >= 0)
+                if (user_write(arg, &flock, sizeof(flock)))
+                    return _EFAULT;
+            return err;
 
         default:
             STRACE("fcntl(%d, %d)", f, cmd);

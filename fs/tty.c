@@ -39,7 +39,10 @@ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     tty->termios.lflags = ISIG_ | ICANON_ | ECHO_ | ECHOE_ | ECHOK_ | ECHOCTL_ | ECHOKE_ | IEXTEN_;
     // from include/asm-generic/termios.h
     memcpy(tty->termios.cc, "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0\0\0", 19);
-    memset(&tty->winsize, 0, sizeof(tty->winsize));
+    tty->winsize = (struct winsize_) {
+        .row = 24,
+        .col = 80,
+    };
 
     lock_init(&tty->lock);
     lock_init(&tty->fds_lock);

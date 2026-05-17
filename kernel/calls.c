@@ -171,6 +171,14 @@ void handle_interrupt(int interrupt) {
         void *ptr = mem_ptr(current->mem, cpu->segfault_addr, cpu->segfault_was_write ? MEM_WRITE : MEM_READ);
         read_wrunlock(&current->mem->lock);
 #ifdef GUEST_ARM64
+        if (ptr == NULL && cpu->segfault_was_write && cpu->segfault_addr == cpu->sp) {
+            write_wrlock(&current->mem->lock);
+            int grow_err = mem_grow_down_to(current->mem, cpu->segfault_addr, P_WRITE);
+            write_wrunlock(&current->mem->lock);
+            if (grow_err == 0)
+                goto gpf_handled;
+        }
+
         // Read fault on unmapped page near a heap mapping: demand-map as
         // readable zeros. On native Linux, heap regions are contiguous so
         // out-of-bounds reads access adjacent allocations (no SIGSEGV). In iSH,

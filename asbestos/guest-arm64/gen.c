@@ -908,6 +908,12 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
     }
     state->last_insn = insn;
 
+    // Keep cpu->pc synchronized before each guest instruction. Without this,
+    // a fault in the middle of a multi-instruction block is reported at the
+    // block start, so retrying recovery can re-run already-completed gadgets.
+    gen(state, (unsigned long) gadget_set_pc);
+    gen(state, state->orig_ip);
+
     // Handle a small subset of SVE/SVE2 instructions (modeled as 128-bit vectors)
     // SVE EOR Zd.D, Zn.D, Zm.D
     if ((insn & 0xffe0fc00) == 0x04a03000) {

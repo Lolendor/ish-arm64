@@ -684,6 +684,39 @@ static void *mem_ptr_nofault(struct mem *mem, addr_t addr, int type) {
     return entry->data->data + entry->offset + PGOFFSET(addr);
 }
 
+#ifdef GUEST_ARM64
+int mem_grow_down_to(struct mem *mem, addr_t addr, int flags) {
+    page_t page = PAGE(addr);
+    page_t stack_page = STACK_INIT_PAGE;
+    while (stack_page < STACK_TOP_PAGE && mem_pt(mem, stack_page) == NULL)
+        stack_page++;
+    if (stack_page >= STACK_TOP_PAGE)
+        return _ENOMEM;
+    if (page >= stack_page)
+        return 0;
+    if (!(mem_pt(mem, stack_page)->flags & P_GROWSDOWN))
+        return _ENOMEM;
+
+    pages_t guard_page = STACK_TOP_PAGE;
+    rlim_t_ stack_limit = rlimit(RLIMIT_STACK_);
+    if (stack_limit != RLIM_INFINITY_) {
+        pages_t stack_pages = guard_page - page;
+        if ((uint64_t)stack_pages * PAGE_SIZE > stack_limit)
+            return _ENOMEM;
+    }
+
+    if (mem_pt(mem, page) == NULL) {
+#if ANON_MMAP_LIMIT_PAGES > 0
+        atomic_fetch_add(&anon_page_count, 1);
+#endif
+        int err = pt_map_nothing(mem, page, 1, flags | P_GROWSDOWN);
+        if (err < 0)
+            return err;
+    }
+    return 0;
+}
+#endif
+
 void *mem_ptr(struct mem *mem, addr_t addr, int type) {
 #ifndef NDEBUG
     void *old_ptr = mem_ptr_nofault(mem, addr, type); // just for an assert
@@ -744,10 +777,7 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
             read_wrlock(&mem->lock);
             goto have_entry;
         }
-#if ANON_MMAP_LIMIT_PAGES > 0
-        atomic_fetch_add(&anon_page_count, 1);
-#endif
-        pt_map_nothing(mem, page, 1, P_WRITE | P_GROWSDOWN);
+        mem_grow_down_to(mem, addr, P_WRITE);
         write_wrunlock(&mem->lock);
         read_wrlock(&mem->lock);
 
