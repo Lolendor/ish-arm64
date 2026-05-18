@@ -868,31 +868,52 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
             read_wrlock(&mem->lock);
             goto have_entry;
         }
-        // Grow stack aggressively: allocate from `page` up to but not
-        // including the next mapped page. This matches native Linux
-        // expand_stack behaviour where a large `sub sp, sp, #N` followed
-        // by stores anywhere within the new frame works without
-        // faulting on every intermediate page. Musl's deeper fs helpers
-        // use ~2-page frames (sub sp, #0x1dd0) — growing one page at a
-        // time on first access misses pages above the fault that
-        // haven't been touched yet, which later store instructions then
-        // fault on. The SIGSEGV handler runs on the same shallow stack
-        // and recursively faults, corrupting PC to 0 (infinite loop).
-        // Cap expansion at 16 pages (64KB) to bound accidental
-        // expansion when a wild pointer just happens to fall into a
-        // growsdown region.
+        // Grow stack aggressively: allocate from `page` (the faulting
+        // page) up to but not including the next mapped page. This
+        // matches native Linux expand_stack behaviour where a large
+        // `sub sp, sp, #N` followed by stores anywhere within the new
+        // frame works without faulting on every intermediate page.
+        // Musl's deeper fs helpers use ~2-page frames; Bun-bundled
+        // binaries open the start of execution with a 100+ KiB stack
+        // probe (claude.exe writes ~127 KiB below SP at fault). Growing
+        // one page at a time on first access misses pages above the
+        // fault that haven't been touched yet, which later store
+        // instructions then fault on. The SIGSEGV handler runs on the
+        // same shallow stack and recursively faults, corrupting PC to
+        // 0 (infinite loop).
         //
-        // (mem_grow_down_to is a sibling helper used by the page-fault
-        // handler in kernel/calls.c for the cpu->sp == fault_addr case;
-        // we keep the inline version here because mem_ptr is on the
-        // hot path and the inline form is what upstream openminis
-        // ships.)
+        // CRITICAL: the faulting `page` MUST end up mapped after this
+        // block runs. Previously we walked back from `grow_end` by
+        // `max_grow` pages, but if (`grow_end - page`) > max_grow we
+        // never mapped `page` itself and the next instruction faulted
+        // again on the same address — observable as a process stuck in
+        // state "R (running)" forever (no syscall trace, no kernel
+        // events, just infinite re-fault).
+        //
+        // Cap distance at 256 pages (1 MiB) to bound accidental
+        // expansion when a wild pointer happens to fall into a
+        // growsdown region. If `page` is farther than 1 MiB below the
+        // existing stack we still grow exactly the page that faulted
+        // plus everything between it and the existing stack — that's
+        // what native Linux does, RLIMIT_STACK provides the real cap.
+        //
+        // (mem_grow_down_to in kernel/calls.c is a sibling helper used
+        // by the page-fault handler for the cpu->sp == fault_addr
+        // case; we keep the inline version here because mem_ptr is on
+        // the hot path.)
         {
-            const pages_t max_grow = 16;
+            const pages_t max_grow = 256;
             pages_t grow_end = p; // first already-mapped page
             pages_t grow_start = page;
-            if ((pages_t)(grow_end - grow_start) > max_grow)
-                grow_start = grow_end - max_grow;
+            if ((pages_t)(grow_end - grow_start) > max_grow) {
+                // The fault is far below the existing stack. Map the
+                // page that faulted plus the (max_grow - 1) pages
+                // above it; the gap between [grow_start + max_grow,
+                // grow_end) stays unmapped but Linux semantics permit
+                // that (each unmapped page can be lazily faulted in
+                // by the same path).
+                grow_end = grow_start + max_grow;
+            }
             pages_t grow_count = grow_end - grow_start;
 #if ANON_MMAP_LIMIT_PAGES > 0
             atomic_fetch_add(&anon_page_count, grow_count);
