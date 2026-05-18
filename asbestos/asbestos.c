@@ -587,9 +587,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         in_jit = 0;
         jit_current_frame = NULL;
 
-        /* (Diagnostic block-exit trace was removed after debugging
-         * the Bun/claude-code JIT busy-loop. To re-enable temporarily,
-         * gate a fprintf on getenv("ISH_BLOCK_TRACE") here.) */
+        /* block-exit diagnostics intentionally absent in production */
 
 
         // Check if fiber_enter returned due to a JIT crash (signal handler
@@ -618,6 +616,24 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
 
         // (debug trace removed)
 
+        // Self-modifying / JIT-generated guest code: write gadgets record
+        // the guest page written into tlb->dirty_page. If we have cached
+        // translated blocks for that page, they must be jetsam'd before the
+        // next dispatch. Bun/Claude-Code hits this: it patches generated
+        // lock-free list/atomic code after first execution; without dirty
+        // page invalidation we keep running the stale placeholder block
+        // (mov x16, #0; cbz x16, loop) forever.
+        if (tlb->dirty_page != TLB_PAGE_EMPTY) {
+            asbestos_invalidate_page(asbestos, PAGE(tlb->dirty_page));
+            tlb->dirty_page = TLB_PAGE_EMPTY;
+            if (tlb->block_cache_gen != asbestos->invalidate_gen) {
+                memset(cache, 0, sizeof(tlb->block_cache));
+                tlb->block_cache_gen = asbestos->invalidate_gen;
+                memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
+                frame->last_block = NULL;
+            }
+        }
+
         // Check if page table changed (mmap/munmap by another thread) EVERY BLOCK.
         if (tlb->mem_changes != __atomic_load_n(&tlb->mmu->changes, __ATOMIC_ACQUIRE)) {
             tlb_flush(tlb);
@@ -632,7 +648,6 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         if (interrupt == INT_NONE && (++frame->cpu.cycle & ((1 << 10) - 1)) == 0)
             interrupt = INT_TIMER;
 
-        /* (PC trace removed; see ISH_BLOCK_TRACE comment above.) */
         // PC histogram: sample on every block exit (not just timer ticks).
         // Weight by guest insn count of the block just executed; this gives
         // the per-insn share rather than per-block-dispatch share.

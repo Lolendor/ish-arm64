@@ -2137,7 +2137,14 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
     // Atomic compare-and-swap (CAS/CASA/CASL/CASAL)
     // Encoding: size:001000:1:A:1:Rs:R:11111:Rn:Rt
     // A=acquire (bit23), R=release (bit15)
-    if ((insn & 0x3f200c00) == 0x08200c00) {
+    // The fixed `11111` field (bits 14:10) is important: without it
+    // the mask also catches LDXP/LDAXP pair-exclusive loads (e.g.
+    // 0xc87f3d2e in Bun/Claude's lock-free list code), which then
+    // compiles the load as a CAS and leaves the matching STLXP store
+    // unreachable. Symptom: Claude Code spins forever in a two-block
+    // loop at startup because the pair value at [x9]/[x9+8] never
+    // changes.
+    if ((insn & 0x3f207c00) == 0x08207c00) {
         uint32_t size = (insn >> 30) & 0x3;
         uint32_t A = (insn >> 23) & 1;    // acquire
         uint32_t R = (insn >> 15) & 1;    // release

@@ -386,7 +386,7 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
 
         case SIGNAL_KILL:
             unlock(&sighand->lock); // do_exit must be called without this lock
-#if defined(GUEST_ARM64) && ISH_DEBUG_SKIP_BRK
+#if defined(GUEST_ARM64) && !defined(ISH_DISABLE_SKIP_BRK)
             // V8 / JSC / Bun emit `BRK #N` (delivers SIGTRAP to the
             // process) for IMMEDIATE_CRASH(), DCHECK_*, and assorted
             // assertion macros at compile time. For Bun specifically,
