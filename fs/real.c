@@ -497,56 +497,32 @@ static int unlinkat_recursive(int parent_fd, const char *name) {
 }
 
 int realfs_rename(struct mount *mount, const char *src, const char *dst) {
-    const char *src_fixed = fix_path(src);
-    const char *dst_fixed = fix_path(dst);
-    int err = renameat(mount->root_fd, src_fixed,
-                       mount->root_fd, dst_fixed);
-    if (err == 0) {
-        // Source is gone, destination appeared. Emit two events; the
-        // Swift consumer filters paths it doesn't care about.
-        fakefs_record_change(src, FAKEFS_CHANGE_OP_UNLINK);
-        fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
-        return 0;
-    }
-    int saved = errno;
-
-    // Linux's renameat() atomically replaces dst if both src and dst are
-    // directories — even when dst is non-empty. macOS / BSD's renameat
-    // returns ENOTEMPTY in that case, which breaks every Linux-targeting
-    // tool that does atomic-replace installs (npm, dpkg-style staging,
-    // etc.). Emulate the Linux semantic here when we can do so safely:
-    //
-    //   - The host-side rename failed with ENOTEMPTY or EEXIST.
-    //   - Both src and dst exist and both are directories on the host.
-    //
-    // We then recursively remove dst and retry the renameat.
-    //
-    // The path manipulation always goes through fix_path() (which
-    // dereferences relative paths against the mount root); racey writers
-    // can't trick this into removing something outside the mount.
-    if (saved == ENOTEMPTY || saved == EEXIST) {
-        struct stat src_st, dst_st;
-        if (fstatat(mount->root_fd, src_fixed, &src_st,
-                    AT_SYMLINK_NOFOLLOW) == 0
-            && fstatat(mount->root_fd, dst_fixed, &dst_st,
-                       AT_SYMLINK_NOFOLLOW) == 0
-            && S_ISDIR(src_st.st_mode)
-            && S_ISDIR(dst_st.st_mode)) {
-            int rm_err = unlinkat_recursive(mount->root_fd, dst_fixed);
-            if (rm_err == 0) {
-                if (renameat(mount->root_fd, src_fixed,
-                             mount->root_fd, dst_fixed) == 0) {
-                    fakefs_record_change(src, FAKEFS_CHANGE_OP_UNLINK);
-                    fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
-                    return 0;
-                }
-                saved = errno;
-            }
-        }
-    }
-    errno = saved;
-    return errno_map();
+    int err = renameat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst));
+    if (err < 0)
+        return errno_map();
+    // Source is gone, destination appeared. Emit two events; the
+    // Swift consumer filters paths it doesn't care about.
+    fakefs_record_change(src, FAKEFS_CHANGE_OP_UNLINK);
+    fakefs_record_change(dst, FAKEFS_CHANGE_OP_RENAME);
+    return 0;
 }
+
+// NOTE: an earlier version of realfs_rename tried to emulate Linux's
+// "renameat over non-empty dir replaces atomically" semantics by
+// recursively removing dst and retrying the rename. That broke npm
+// pacote's tar-extract pipeline: pacote calls rename(staging, final)
+// where the fakefs path layer collapses staging and final to the
+// same host-side inode (or to overlapping paths), and our recursive
+// removal then wiped the very contents that were supposed to land at
+// dst. Symptom: claude-code-linux-arm64-musl package extracted as
+// "just `claude`" with no package.json, breaking the postinstall.
+//
+// Linux 3.15 has RENAME_EXCHANGE / renameat2 which is the proper way
+// to atomically swap two non-empty dirs, but macOS/host doesn't
+// expose it via plain renameat. For now we surface ENOTEMPTY back to
+// userspace and let npm's own retry logic handle it (it does — npm
+// pacote already detects ENOTEMPTY and does its own recursive
+// cleanup).
 
 int realfs_symlink(struct mount *mount, const char *target, const char *link) {
     int err = symlinkat(target, mount->root_fd, fix_path(link));

@@ -587,6 +587,10 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         in_jit = 0;
         jit_current_frame = NULL;
 
+        /* (Diagnostic block-exit trace was removed after debugging
+         * the Bun/claude-code JIT busy-loop. To re-enable temporarily,
+         * gate a fprintf on getenv("ISH_BLOCK_TRACE") here.) */
+
 
         // Check if fiber_enter returned due to a JIT crash (signal handler
         // redirected PC to jit_crash_trampoline which returns INT_JIT_CRASH).
@@ -627,6 +631,8 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
             interrupt = INT_TIMER;
         if (interrupt == INT_NONE && (++frame->cpu.cycle & ((1 << 10) - 1)) == 0)
             interrupt = INT_TIMER;
+
+        /* (PC trace removed; see ISH_BLOCK_TRACE comment above.) */
         // PC histogram: sample on every block exit (not just timer ticks).
         // Weight by guest insn count of the block just executed; this gives
         // the per-insn share rather than per-block-dispatch share.
