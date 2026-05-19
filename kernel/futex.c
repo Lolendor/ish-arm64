@@ -196,45 +196,18 @@ static int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
             read_wrunlock(&current->mem->lock);
             if (ptr == NULL) { err = _EFAULT; break; }
             if (*ptr != val) { err = 0; break; }
-            // Safety valve: continuous infinite futex stall > 180s.
-            if (timeout == NULL && stall_count >= 1800) { // 1800 * 100ms = 180s
-                bool has_live_children = false;
-                int live = 0;
-                lock(&pids_lock);
-                lock(&current->group->lock);
-                struct task *t;
-                list_for_each_entry(&current->group->threads, t, group_links) {
-                    live++;
-                    struct task *child;
-                    list_for_each_entry(&t->children, child, siblings) {
-                        if (child->group == current->group)
-                            continue;
-                        if (!child->zombie)
-                            has_live_children = true;
-                    }
-                }
-                unlock(&current->group->lock);
-                unlock(&pids_lock);
-                if (live > 1 && !has_live_children) {
-                    if (ish_exec_trace())
-                        printk("SAFETY-VALVE[futex]: pid=%d stalled %ds in futex_wait(uaddr=0x%x val=%d), %d threads, no children → exit_group\n",
-                               current->pid, stall_count / 10, uaddr, val, live);
-                    // Clean up our wait queue entry before exiting — the
-                    // wait struct lives on this thread's stack, so leaving
-                    // it linked into futex->queue after exit_group would
-                    // leave a dangling pointer. Other threads doing
-                    // futex_wake / futex_put_unlocked would then trip the
-                    // assert(list_empty(&futex->queue)) in futex.c:93 when
-                    // refcount hits 0.
-                    lock(&futex_lock);
-                    list_remove_safe(&wait.queue);
-                    futex_put_unlocked(wait.futex);
-                    unlock(&futex_lock);
-                    current->blocking = false;
-                    do_exit_group(0);
-                }
-                if (has_live_children)
-                    stall_count = 0;
+            // Periodic spurious wake to keep Bun/JSC parking-lot mutexes
+            // from livelocking under our userspace scheduler when a wake
+            // gets lost. Linux already permits spurious wakeups (libc
+            // users must re-check the guarded word), so this is safe.
+            // Returning 0 makes glibc/musl re-test the futex word and
+            // re-park if still equal. The previous OpenMinis safety
+            // valve called do_exit_group(0) here, which silently killed
+            // claude-code with no output.
+            if (timeout == NULL && stall_count >= 50) { // 5 s
+                err = 0;
+                stall_count = 0;
+                break;
             }
         }
         current->blocking = false;
